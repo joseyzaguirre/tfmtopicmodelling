@@ -1,0 +1,34 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+.Renviron
+*_cache/
+rsconnect/
+
+# renv (renv.lock SÍ se sube)
+renv/library/
+renv/local/
+renv/staging/
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# ---- Datos y archivos intermedios: se ignoran por defecto ----
+# (contienen texto de posts o de artículos, o se pueden regenerar)
+*.csv
+*.rds
+*.pdf
+*.html
+*.udpipe
+data/raw/
+official_cientific_corpus/
+checkpoint_v1_sin_stopwords_custom/
+
+# ---- Excepciones: esto SÍ se sube (no contiene texto) ----
+!data/ids/*.csv
+!outputs/tables/*.csv
+!modelo_final_btm.rds
+!topic_dominante_final.rds
