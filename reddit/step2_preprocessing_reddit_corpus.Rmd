@@ -1,0 +1,244 @@
+---
+title: "MTh - Preprocessing pipeline for r/AutismInWomen corpus"
+subtitle: "Text cleaning, tokenization, stopword removal and lemmatization"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+This document builds the preprocessing pipeline applied to the filtered corpus of `r/AutismInWomen` produced at the end of the EDA (`has_text == TRUE`, ~57,070 posts). It covers author anonymization, text cleaning, tokenization, stopword removal, and lemmatization, and produces the token table that the topic model uses as input.
+
+**Pipeline note:** lemmatization with `udpipe` is run on lightly-cleaned text (URLs and bracket tags removed only), not on heavily-cleaned text (lowercased and stripped of punctuation). `udpipe` performs linguistic tokenization and POS-tagging, which relies on case and punctuation, for example to correctly split contractions like `don't` into `do` + `not`, or to detect proper nouns. Lowercasing, punctuation removal, and stopword filtering are applied *after* lemmatization, on the resulting lemma column, not before.
+
+**Note:** the udpipe model (`english-ewt-ud-2.5-191206`) is downloaded automatically if it is not in the project folder, and the number of cores used for annotation adapts to the machine (up to 7). The number of cores does not change the results, because each post is annotated independently.
+
+The `tidyverse` meta-package bundles the core libraries needed here (`dplyr`, `readr`, `stringr`, `tidyr`).
+
+```{r libraries}
+# Load packages
+library(tidyverse)
+library(digest)
+library(tidytext)
+library(udpipe)
+```
+
+## Step 1: Loading the filtered corpus
+
+The input file is the corpus already filtered to `has_text == TRUE` in the EDA document, not the raw scrape.
+
+```{r load-data}
+# Read the filtered corpus from step 1
+reddit_filtered <- read_csv("reddit_filtered.csv")
+
+dim(reddit_filtered)
+```
+
+## Step 2: Author anonymization
+
+`digest()` is deterministic: the same username always produces the same SHA-256 hash. This preserves the author-post relational structure, which would allow checking whether a single author dominates a topic, while replacing the username with a hash. That check is not part of the analysis in this repository, so the hash is not used in later steps and is never exported.
+
+```{r anonymize-author}
+# Replace usernames with a SHA-256 hash, then drop the username
+reddit_filtered <- reddit_filtered |>
+  mutate(author_hash = map_chr(author, ~ digest::digest(.x, algo = "sha256"))) |>
+  select(-author)
+```
+
+## Step 3: Combining title and text into a single document
+
+`coalesce(text, "")` handles the four posts (identified in the EDA) where `text` is `NA` but the content lives entirely in `title`. Without it, `paste()` would propagate `NA` and those posts would be lost entirely when combined.
+
+```{r combine-title-text}
+# Join title and text into one document (title only if text is NA)
+reddit_filtered <- reddit_filtered |>
+  mutate(
+    text = coalesce(text, ""),
+    document = str_squish(paste(title, text))
+  )
+```
+
+## Step 4: Light cleaning (pre-lemmatization)
+
+Only URLs and bracket tags (`[CW/TW]`, `[removed]`, `[deleted]`) are removed at this stage. Everything else (case, apostrophes, punctuation, non-ASCII characters, digits) is intentionally left untouched, since `udpipe` needs that information to tokenize and POS-tag correctly. Confirmed empirically: `udpipe` splits and lemmatizes `"don't"` correctly regardless of whether the apostrophe is straight (`'`) or curly (`’`), producing `do` + `not` in both cases.
+
+```{r light-cleaning}
+# Remove URLs and [bracket tags]; keep the rest for udpipe
+reddit_filtered <- reddit_filtered |>
+  mutate(
+    document_clean = document |>
+      str_remove_all("http\\S+|www\\.\\S+") |>
+      str_remove_all("\\[.*?\\]") |>
+      str_squish()
+  )
+```
+
+## Step 5: Lemmatization with udpipe
+
+The English language model is loaded once. Both straight (`'`) and curly (`’`) apostrophes were verified empirically to be handled identically by `udpipe`'s tokenizer and lemmatizer (both correctly resolve `don't` to `do` + `not`), so no apostrophe normalization is needed before annotation. If the model file is not in the project folder, it is downloaded first (English EWT, UD 2.5, about 16 MB). The model file is not redistributed in the repository.
+
+```{r load-udpipe-model}
+# Download the English model once if it is not in the project folder
+udmodel_file <- "english-ewt-ud-2.5-191206.udpipe"
+if (!file.exists(udmodel_file)) {
+  invisible(udpipe_download_model(language = "english-ewt", model_dir = ".",
+                                  udpipe_model_repo = "jwijffels/udpipe.models.ud.2.5"))
+}
+
+# Load the model
+udmodel <- udpipe_load_model(file = udmodel_file)
+```
+
+`udpipe_annotate()` does not have a `parallel.cores` argument, verified against the installed package's formal arguments. Annotating the full corpus (~57,070 posts) sequentially took ~18s per 200 posts in testing, projecting to roughly 85 minutes for the full corpus. Manual parallelization is used instead, with the base `parallel` package (`PSOCK` cluster, portable across Windows/Mac/Linux), splitting the corpus into one chunk per core and loading the model independently in each worker process.
+
+Annotating ~57,000 posts is expensive even parallelized, and knitting re-runs every chunk from a fresh R session regardless of whether anything actually changed. Rather than pay that cost on every knit, the result is cached to disk: if `annotation_reddit.rds` already exists, it's loaded directly; otherwise the parallel annotation runs once and gets saved for next time.
+
+**Note:** this cache is not invalidated automatically. If `document_clean` (Step 4) or the udpipe model changes, `annotation_reddit.rds` must be deleted by hand before re-knitting, or the cached, now-stale annotation will get reused silently.
+
+```{r annotate-parallel}
+# Lemmatize with udpipe in parallel; reuse the saved result if it exists
+annotation_file <- "annotation_reddit.rds"
+
+if (file.exists(annotation_file)) {
+
+  annotation <- readRDS(annotation_file)
+
+} else {
+
+  library(parallel)
+
+  n_cores <- min(7, max(1, detectCores() - 1))  # up to 7 workers (as originally used), fewer on smaller machines
+  udmodel_path <- "english-ewt-ud-2.5-191206.udpipe"
+
+  chunks <- split(reddit_filtered, cut(seq_len(nrow(reddit_filtered)), n_cores, labels = FALSE))
+
+  cl <- makeCluster(n_cores)
+  clusterEvalQ(cl, library(udpipe))
+  clusterExport(cl, "udmodel_path")
+
+  resultado <- parLapply(cl, chunks, function(chunk) {
+    modelo_local <- udpipe_load_model(file = udmodel_path)
+    udpipe_annotate(modelo_local, x = chunk$document_clean, doc_id = chunk$id) |> as.data.frame()
+  })
+
+  stopCluster(cl)
+
+  annotation <- bind_rows(resultado)
+
+  saveRDS(annotation, annotation_file)
+}
+
+nrow(annotation)
+n_distinct(annotation$doc_id)
+```
+
+## Step 6: POS filtering and final lemma table
+
+The grammatical category (`upos`) distribution across all tokens was inspected before deciding which categories to keep:
+
+```{r upos-distribution}
+# Count tokens by part of speech
+annotation |>
+  count(upos, sort = TRUE) |>
+  mutate(pct = n / sum(n) * 100)
+```
+
+### How the categories were chosen
+
+Categories are kept or dropped according to one question: does the word help tell what a post is about? Nouns, verbs, adjectives, adverbs and proper nouns name things, actions, qualities and manner, so their presence changes with the subject of the post and they are kept. Pronouns, auxiliaries, prepositions, determiners, conjunctions and particles do grammatical work instead: they appear in almost every post and cannot separate one theme from another, so they are dropped. The distribution above supports this, since `PRON` alone is 15.5% of all tokens and the seven function categories together make up about 46%, enough to dominate the co-occurrence patterns the models learn from if they were left in.
+
+A few other categories needed a case-by-case decision. `PUNCT` is dropped because punctuation marks are not words. `INTJ` (e.g. "lol", "yes") is dropped because it expresses a reaction rather than a subject. `NUM` is dropped because numbers such as ages, counts or dates rarely say what a post is about on their own. `X` and `SYM` are dropped as unclassified tokens and symbols, mostly noise. `PROPN` is kept, for the reason given below. The table shows the most frequent lemmas of each category, so the decision can be checked against this corpus rather than taken on faith.
+
+```{r upos-examples}
+# Top 8 lemmas per part of speech (lemmas only, no post text)
+annotation |>
+  mutate(lemma = str_to_lower(lemma)) |>
+  count(upos, lemma, sort = TRUE) |>
+  group_by(upos) |>
+  slice_head(n = 8) |>
+  summarise(top_lemmas = paste(lemma, collapse = ", "), .groups = "drop")
+```
+
+This is a judgement call, not a measured property: a kept category still contains words with little topical value (`feel`, `time`, `people`); how to treat them is discussed in 7.1 below.
+
+`NOUN`, `VERB`, `ADJ`, `ADV` and `PROPN` are retained; all other categories (`PRON`, `PUNCT`, `AUX`, `ADP`, `DET`, `CCONJ`, `PART`, `SCONJ`, `NUM`, `INTJ`, `SYM`, `X`) are dropped. `PROPN` is included deliberately: proper nouns in this corpus include named conditions (`autism`, `adhd`, `audhd`) that carry topical relevance, rather than being purely functional. The category also lets through some noise (for example `f`), which is accepted given how few tokens it involves. Note that filtering out `NUM` also makes a separate digit-removal step unnecessary, since `udpipe` already isolates numeric tokens as their own category.
+
+
+```{r final-lemma-table}
+# Keep nouns, verbs, adjectives, adverbs and proper nouns; lowercase lemmas
+tokens_lemmatized <- annotation |>
+  filter(upos %in% c("NOUN", "VERB", "ADJ", "ADV", "PROPN")) |>
+  select(id = doc_id, lemma) |>
+  mutate(lemma = str_to_lower(lemma))
+```
+
+Lowercasing is applied here, on `lemma`, not earlier: `PROPN` detection by `udpipe` relies on the original casing, so lowercasing before annotation would have removed that signal. Without this step, `"Reddit"` and `"reddit"` would also survive as two distinct tokens in the final vocabulary.
+
+```{r verify-counts}
+# Number of tokens kept
+nrow(tokens_lemmatized)
+```
+
+## Step 7: Stopword removal on lemmas
+
+With lemmatization already resolving contractions correctly (`don't` becoming `do` + `not`), the standard lexicon alone is sufficient; no expanded version is needed.
+
+```{r stopwords-on-lemma}
+# Remove stopwords and lemmas of 2 characters or fewer; show the top 40
+tokens_clean <- tokens_lemmatized |>
+  anti_join(stop_words, by = c("lemma" = "word")) |>
+  filter(str_length(lemma) > 2)
+
+tokens_clean |>
+  count(lemma, sort = TRUE) |>
+  slice_head(n = 40)
+```
+
+The resulting top-40 lemmas show no leftover contraction fragments, confirming the standard lexicon is sufficient here. As a side confirmation of the choice of lemmatization over stemming: `diagnose`/`diagnosis` and `feel`/`feeling` appear as correctly distinct lemmas (verb vs. noun forms), rather than being merged or truncated as a stemmer would likely have done.
+
+### 7.1: Domain-specific stopwords, deferred decision
+
+Several high-frequency lemmas (`feel`, `people`, `time`, `day`, `lot`) carry high raw frequency but questionable topic-differentiating value, while comparably frequent terms (`autistic`, `autism`, `diagnose`, `diagnosis`) are core subject-matter terms.
+
+**Decision:** no additional domain-specific stopwords are applied at this stage. `tokens_clean` is carried forward as-is into topic modelling. This list will be revisited after inspecting the first topic model run, adding only terms shown to dominate multiple topics without adding interpretive value.
+
+This `tokens_clean` table (columns `id`, `lemma`) is the final input for the topic modelling document.
+
+## Step 8: Export
+
+The final lemmatized, stopword-filtered token table is exported as a backup before moving to the modelling document, so the (computationally expensive) `udpipe` annotation step does not need to be re-run.
+
+```{r export-tokens}
+# Save the token table for step 3
+write_csv(tokens_clean, "tokens_clean_lemmatized.csv")
+```
+
+## Step 9: Summary of excluded documents
+
+Documents left after each stage of this document. The scraped total comes from the EDA (step 1).
+
+```{r docs-flow}
+# Documents left after each stage, and how many were lost at each one
+n_raw <- 68788  # posts scraped (counted in the EDA, step 1)
+
+docs_flow <- tibble(
+  stage  = c("Scraped posts (EDA)", "After has_text filter", "After POS and stopword filtering"),
+  n_docs = c(n_raw, nrow(reddit_filtered), n_distinct(tokens_clean$id))
+) |>
+  mutate(excluded = lag(n_docs) - n_docs)
+
+docs_flow
+```
+
+Of the `r format(n_raw, big.mark = ",")` scraped posts, `r format(docs_flow$excluded[2], big.mark = ",")` are excluded by the `has_text` filter: their text is `[removed]` (by moderators), `[deleted]` (by the author) or empty, so there is nothing to model. The four posts with no text but a title are kept (see the EDA). A further `r docs_flow$excluded[3]` posts lose every word during POS and stopword filtering: they are very short, so nothing meaningful is left. This leaves `r format(docs_flow$n_docs[3], big.mark = ",")` posts with tokens.

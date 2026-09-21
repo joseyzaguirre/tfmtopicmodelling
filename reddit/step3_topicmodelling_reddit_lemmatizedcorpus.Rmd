@@ -1,0 +1,845 @@
+---
+title: "MTh - Topic modelling on r/AutismInWomen corpus"
+subtitle: "BTM, applied to the preprocessed and lemmatized corpus"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+This document fits the BTM (Biterm Topic Model) to the preprocessed, lemmatized token table (`tokens_clean_lemmatized.csv`) and selects k. A Document-Term Matrix is also built at a couple of points, not to fit a topic model, but because `topicdoc`'s coherence function needs a DTM to score BTM's topics.
+
+**Note:** the model-fitting chunks (Steps 6, 13 and 15) load each model from disk if its `.rds` file already exists and fit it otherwise. The tables that summarise model selection (coherence and top words by k) are also saved as CSV in `outputs/tables/`, and Step 18 saves a table with each post's id and flair, without text. The chunks that inspect individual posts (9.3, 17.2 and 17.4) show only ids, flairs and lengths, so the rendered report contains no post text.
+
+```{r libraries}
+# Load packages
+library(tidyverse)
+library(tidytext)
+library(BTM)
+library(topicdoc)
+```
+
+```{r}
+# Folder for the tables saved by this document
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Step 1: Loading the preprocessed tokens
+
+```{r}
+# Read the token table from step 2
+tokens_clean <- read_csv("tokens_clean_lemmatized.csv")
+
+nrow(tokens_clean)
+n_distinct(tokens_clean$id)
+```
+
+## Step 2: Vocabulary pruning
+
+```{r}
+# Build a document-term matrix (only to inspect the vocabulary)
+dtm <- tokens_clean |>
+  count(id, lemma) |>
+  cast_dtm(id, lemma, n)
+
+dtm
+```
+
+`Maximal term length: 76` is a red flag; no real English word is that long.
+
+```{r}
+# The 20 longest lemmas, to spot noise
+tokens_clean |>
+  mutate(largo = str_length(lemma)) |>
+  arrange(desc(largo)) |>
+  distinct(lemma, largo) |>
+  slice_head(n = 20)
+```
+
+The 20 longest lemmas fall into four patterns: broken URL fragments the light-cleaning regex missed (relative Reddit links, query strings, mailto addresses, bare domains), letter-elongated words used for emphasis (`haaaaha`, `muuuuch`), whole phrases typed with hyphens or slashes instead of spaces (`udpipe` treats hyphenated text as a single token), and keyboard-mashing strings. Each pattern typically shows up in only 1-2 documents, so rather than writing a specific rule for each one, a minimum document-frequency cutoff handles all of them at once.
+
+```{r}
+# Keep only lemmas that appear in at least 5 documents
+doc_freq_lemma <- tokens_clean |>
+  distinct(id, lemma) |>
+  count(lemma, name = "n_docs")
+
+vocab_valido <- doc_freq_lemma |>
+  filter(n_docs >= 5) |>
+  pull(lemma)
+
+tokens_clean_pruned <- tokens_clean |>
+  filter(lemma %in% vocab_valido)
+
+n_distinct(tokens_clean$lemma)
+n_distinct(tokens_clean_pruned$lemma)
+```
+
+```{r}
+# Total tokens before and after pruning
+nrow(tokens_clean)
+nrow(tokens_clean_pruned)
+```
+
+```{r}
+# Documents before and after pruning
+n_distinct(tokens_clean$id)
+n_distinct(tokens_clean_pruned$id)
+```
+
+Vocabulary shrinks from 54,029 to 16,542 terms (-69.4%), while total token volume drops by only 1.84% (3,324,990 to 3,263,920 tokens). The removed vocabulary was overwhelmingly rare noise (broken URLs, gibberish, elongations), not substantive content. Nine documents lose all their tokens at this step, consistent with the eight already lost during POS filtering and stopword removal in preprocessing: short, low-content posts with no distinctive vocabulary surviving the cutoff.
+
+**Decision:** the minimum document-frequency cutoff (`n_docs >= 5`) is accepted as the final vocabulary pruning rule.
+
+```{r}
+# Save the pruned tokens and rebuild the document-term matrix
+write_csv(tokens_clean_pruned, "tokens_clean_pruned.csv")
+
+dtm_final <- tokens_clean_pruned |>
+  count(id, lemma) |>
+  cast_dtm(id, lemma, n)
+
+dtm_final
+```
+
+## Step 3: Scope exclusions, non-English content and encoding artifacts
+
+One post written entirely in a decorative Unicode font (unreadable to the English `udpipe` pipeline) and ten posts written in Portuguese, Spanish, or Korean are excluded, since this pipeline assumes English text throughout (`udpipe`'s English model, English stopword lexicon). This is a known limitation: the language heuristic used to detect these is conservative, so some additional non-English content likely remains undetected, though the affected share is expected to stay small (<0.1%).
+
+```{r}
+# IDs of posts to exclude (non-English or unreadable)
+ids_exclude <- c(
+  "1pbds33",  # decorative Unicode font, unreadable to the English pipeline
+  "1itjga2", "1r8q9sj", "1rbb6py", "1rbc1gc", "1rczmz2", "1rpuzpr", "1tawwpj",  # Portuguese
+  "1nc1b05", "1nd6s7u",  # Spanish
+  "1t0x8dt"  # Korean
+)
+
+length(ids_exclude)
+```
+
+11 IDs are listed here, but 2 of them may already have been removed by the Step 2 vocabulary pruning, since a non-English post can also happen to have an entirely rare vocabulary. Checked directly instead of assumed:
+
+```{r}
+# How many of these IDs are still in the pruned corpus
+sum(ids_exclude %in% tokens_clean_pruned$id)
+```
+
+## Step 4: Preparing data for BTM
+
+The `BTM` package expects a two-column data frame (`doc_id`, `token`), the same shape already produced by preprocessing, renamed to match and with the Step 3 exclusions applied.
+
+```{r}
+# Build the BTM input (doc_id, token) without the excluded posts
+btm_data <- tokens_clean_pruned |>
+  rename(doc_id = id, token = lemma) |>
+  filter(!doc_id %in% ids_exclude) |>
+  as.data.frame()
+
+nrow(btm_data)
+n_distinct(btm_data$doc_id)
+```
+
+Candidate values of k are set for later comparison via coherence, kept small and manageable rather than exploring a wide range.
+
+```{r}
+# Candidate values of k
+k_candidatos <- c(5, 8, 10, 12, 15)
+```
+
+## Step 5: Determining feasible BTM parameters (window, iter)
+
+A first attempt to fit `BTM()` directly on the full corpus with default parameters (`iter = 1000`, `window = 15`) did not return output after more than 30 minutes. Rather than waiting indefinitely or guessing new parameters, the computational cost was diagnosed properly before trying again.
+
+### 5.1: Why it was slow, document length distribution
+
+```{r}
+# The 15 longest documents, in tokens
+btm_data |>
+  count(doc_id, name = "n_tokens") |>
+  arrange(desc(n_tokens)) |>
+  slice_head(n = 15)
+```
+
+```{r}
+# Summary of document length in tokens
+btm_data |>
+  count(doc_id, name = "n_tokens") |>
+  summarise(
+    min = min(n_tokens), p25 = quantile(n_tokens, 0.25), mediana = median(n_tokens),
+    media = mean(n_tokens), p75 = quantile(n_tokens, 0.75), p95 = quantile(n_tokens, 0.95),
+    max = max(n_tokens)
+  )
+```
+
+Median document length is 47 tokens (p95 = 143), so even typical posts generate a large number of word pairs, since BTM's default behavior pairs every token in a document with every other token (quadratic growth).
+
+### 5.2: Quantifying the cost, total biterms without a window
+
+```{r}
+# Total biterms if every token is paired with every other token
+btm_data |>
+  count(doc_id, name = "n_tokens") |>
+  mutate(biterms_por_doc = n_tokens * (n_tokens - 1) / 2) |>
+  summarise(total_biterms = sum(biterms_por_doc))
+```
+
+~137 million biterms confirms the scale of the problem.
+
+### 5.3: Reducing the cost with a bounded window
+
+Instead of pairing every token with every other token, `window` bounds the context to nearby tokens only, turning quadratic growth into roughly linear growth.
+
+```{r}
+# Total biterms for different window sizes
+calcular_biterms_con_ventana <- function(n_tokens, w) {
+  ifelse(n_tokens <= 1, 0,
+    ifelse(n_tokens <= w,
+      n_tokens * (n_tokens - 1) / 2,
+      (n_tokens - w + 1) * (w - 1) + (w - 2) * (w - 1) / 2
+    )
+  )
+}
+
+btm_data |>
+  count(doc_id, name = "n_tokens") |>
+  summarise(
+    sin_ventana = sum(n_tokens * (n_tokens - 1) / 2),
+    ventana_20 = sum(calcular_biterms_con_ventana(n_tokens, 20)),
+    ventana_15 = sum(calcular_biterms_con_ventana(n_tokens, 15)),
+    ventana_10 = sum(calcular_biterms_con_ventana(n_tokens, 10))
+  )
+```
+
+`window = 15` cuts the total to ~39.8M (-71%), without going to an extreme; comparable to typical context-window sizes used in word co-occurrence methods (word2vec, GloVe). It is also conceptually appropriate here: BTM was designed for short texts, where the whole document is a reasonable context window, and an explicit window recovers that assumption for the longer posts in this corpus.
+
+### 5.4: Testing runtime on a sample before committing to the full corpus
+
+```{r}
+# Time BTM on a 2,000-post sample (100 iterations)
+set.seed(1234)
+sample_ids_btm <- sample(unique(btm_data$doc_id), 2000)
+btm_data_sample <- btm_data |> filter(doc_id %in% sample_ids_btm)
+
+tiempo_btm_muestra <- system.time({
+  modelo_muestra <- BTM(
+    btm_data_sample, k = 10, beta = 0.01, iter = 100, window = 15, background = TRUE
+  )
+})
+
+tiempo_btm_muestra
+```
+
+### 5.5: Checking how runtime scales with iter
+
+```{r}
+# Time BTM on the same sample with 200 iterations
+set.seed(1234)
+tiempo_btm_iter200 <- system.time({
+  modelo_muestra_200 <- BTM(
+    btm_data_sample, k = 10, beta = 0.01, iter = 200, window = 15, background = TRUE
+  )
+})
+
+tiempo_btm_iter200
+```
+
+Doubling `iter` (100 to 200) roughly doubled runtime (`r round(tiempo_btm_muestra["elapsed"], 1)`s to `r round(tiempo_btm_iter200["elapsed"], 1)`s elapsed), confirming linear scaling. `BTM()` does not expose a log-likelihood trace to check convergence directly (`args(BTM)` confirms `trace` only prints progress messages, and the returned object has no per-iteration diagnostic). Convergence is checked empirically instead: fitting the same model with increasing `iter` and comparing whether the top words per topic stabilize.
+
+```{r}
+# Project the sample timings to the full corpus
+factor_corpus_completo <- n_distinct(btm_data$doc_id) / n_distinct(btm_data_sample$doc_id)
+
+tibble(
+  iter = c(100, 200),
+  tiempo_muestra_seg = c(tiempo_btm_muestra["elapsed"], tiempo_btm_iter200["elapsed"])
+) |>
+  mutate(proyeccion_corpus_completo_min = round(tiempo_muestra_seg * factor_corpus_completo / 60, 1))
+```
+
+Scaling the sample timings up to the full corpus (a `r round(factor_corpus_completo, 1)`x factor over this 2,000-doc sample) gives the projected minutes per model above; both impractical for testing 5 candidate k values without first checking whether fewer iterations are actually enough.
+
+### 5.6: Empirical convergence check
+
+`BTM()` learns its topics by repeating a sampling step `iter` times: with too few repetitions the topics are still changing, and every extra repetition costs time. Since the package reports no convergence measure, whether 200 iterations are enough is checked empirically. The same model (k = 10, same 2,000-post sample, same seed) is fitted with 200 iterations (5.5) and with 400 (below); if 200 were too few, doubling them should change the topics noticeably, and if the topics barely move, the extra iterations only add cost.
+
+The two models are compared through the top 8 words of each topic. Topic numbers line up between them in this run (same seed), so topic *n* in one model is compared with topic *n* in the other: both lists are printed first, and a table then counts how many of the 8 words each pair of topics shares. This is a practical check, not a formal proof of convergence, and it uses a 2,000-post sample and k = 10 rather than the full corpus.
+
+```{r}
+# Fit the same model with 400 iterations
+set.seed(1234)
+tiempo_btm_iter400 <- system.time({
+  modelo_iter400 <- BTM(
+    btm_data_sample, k = 10, beta = 0.01, iter = 400, window = 15, background = TRUE
+  )
+})
+
+tiempo_btm_iter400
+```
+
+```{r}
+# Top 8 words per topic, 200 iterations
+terms(modelo_muestra_200, top_n = 8)
+```
+
+```{r}
+# Top 8 words per topic, 400 iterations
+terms(modelo_iter400, top_n = 8)
+```
+
+```{r}
+# For each topic: how many of the top 8 words are the same at 200 and 400 iterations
+terms_200 <- terms(modelo_muestra_200, top_n = 8)
+terms_400 <- terms(modelo_iter400, top_n = 8)
+
+tibble(
+  topic = seq_along(terms_200),
+  shared_words = map_int(
+    seq_along(terms_200),
+    ~ length(intersect(terms_200[[.x]]$token, terms_400[[.x]]$token))
+  )
+)
+```
+
+Comparing the top-8 words per topic between `iter=200` and `iter=400`: 7 of 10 topics are exactly the same word set (only minor internal re-ordering), and the remaining 3 differ by a single word out of 8. The thematic core of every topic is stable well before iteration 200.
+
+**Decision:** `iter = 200` is adopted as the final iteration count, chosen from this convergence check rather than for convenience. Combined with `window = 15`, this keeps the full-corpus fit for all 5 candidate k values to a manageable, overnight-run scale.
+
+## Step 6: Fitting one BTM model per candidate k
+
+Each model is saved to disk as soon as it finishes, and the loop checks for existing files before fitting, so an interrupted run (e.g. the computer shutting down mid-way) can be resumed without recomputing models already completed.
+
+If a model's `.rds` file already exists, it is loaded; otherwise the model is fitted and saved. Refitting from scratch is slow: the projection in 5.5 is about 29 minutes per model on the full corpus, so the five models take a few hours.
+
+```{r}
+# Fit one BTM per k, or load it if already saved
+modelos_btm <- list()
+
+for (k in k_candidatos) {
+  archivo_k <- paste0("modelo_btm_k", k, ".rds")
+
+  if (file.exists(archivo_k)) {
+    cat("k =", k, "ya existe en disco, cargando en vez de re-ajustar...\n")
+    modelo <- readRDS(archivo_k)
+  } else {
+    cat("Ajustando BTM con k =", k, "...\n")
+
+    set.seed(1234)
+    tiempo <- system.time({
+      modelo <- BTM(
+        btm_data, k = k, beta = 0.01, iter = 200, window = 15, background = TRUE
+      )
+    })
+
+    cat("  k =", k, "- tiempo:", tiempo["elapsed"], "segundos\n")
+    saveRDS(modelo, archivo_k)
+  }
+
+  modelos_btm[[paste0("k", k)]] <- modelo
+}
+
+saveRDS(modelos_btm, "modelos_btm_todos.rds")
+```
+
+## Step 7: Coherence across candidate k values
+
+Coherence (Mimno et al., 2011, the UMass-style measure implemented in `topicdoc`) quantifies, for each topic, how often its top words genuinely co-occur across the corpus's documents, rather than being grouped together by the model without real textual support. Values closer to 0 indicate higher coherence.
+
+`topicdoc::topic_coherence()` only dispatches on `topicmodels`-class objects (LDA/CTM), not on `BTM`-class models. Its internal, non-exported `coherence()` helper is generic, though: it only needs a document-term matrix and a character vector of top words per topic, so it is called directly here, supplying BTM's own top terms manually.
+
+```{r}
+# DTM built over exactly the same documents used by BTM (scope exclusions applied)
+dtm_coherence <- btm_data |>
+  count(doc_id, token) |>
+  cast_dtm(doc_id, token, n)
+
+calcular_coherencia_btm <- function(modelo, dtm, top_n = 10) {
+  topics_terms <- terms(modelo, top_n = top_n)
+  coherencias <- map_dbl(topics_terms, function(topic_df) {
+    palabras <- topic_df$token
+    topicdoc:::coherence(dtm, palabras, smoothing_beta = 1)
+  })
+  mean(coherencias)
+}
+
+resultados_coherencia <- tibble(
+  k = k_candidatos,
+  coherencia_promedio = map_dbl(k_candidatos, function(k) {
+    modelo <- readRDS(paste0("modelo_btm_k", k, ".rds"))
+    calcular_coherencia_btm(modelo, dtm_coherence)
+  })
+)
+
+# Save the table (also printed below)
+write_csv(resultados_coherencia, "outputs/tables/btm_v1_coherence_by_k.csv")
+
+resultados_coherencia
+```
+
+Coherence decreases as k increases (-93.95 at k=5 to -108.08 at k=15), with no recovery at higher k. This answers whether to extend the range further: the trend gives no reason to expect improvement, only further decline.
+
+k=5 (-93.95) and k=8 (-94.29) differ by only 0.34 on this metric, so a qualitative comparison of topic content is needed to choose between them.
+
+## Step 8: Qualitative comparison, k=5 vs. k=8
+
+```{r}
+# Top words per topic for k = 5 and k = 8
+resumen_topics <- function(modelo, top_n = 10) {
+  terms_list <- terms(modelo, top_n = top_n)
+  map_dfr(seq_along(terms_list), function(i) {
+    tibble(topic = i, palabras_top = paste(terms_list[[i]]$token, collapse = ", "))
+  })
+}
+
+modelo_k5 <- readRDS("modelo_btm_k5.rds")
+modelo_k8 <- readRDS("modelo_btm_k8.rds")
+
+resumen_k5 <- resumen_topics(modelo_k5) |> mutate(modelo = "k = 5", .before = topic)
+resumen_k8 <- resumen_topics(modelo_k8) |> mutate(modelo = "k = 8", .before = topic)
+
+topics_v1_k5_k8 <- bind_rows(resumen_k5, resumen_k8)
+
+# Save the table (also printed below)
+write_csv(topics_v1_k5_k8, "outputs/tables/btm_v1_top_words_k5_k8.csv")
+
+topics_v1_k5_k8
+```
+
+At k=5, only 2 of 5 topics are clearly distinct (sensory experience; diagnosis). The remaining 3 overlap heavily around the same generic words (`feel`, `people`, `time`, `friend`, `life`, `lot`, `talk`) and are hard to tell apart.
+
+At k=8, several of those merged topics split into more specific themes: relationships, family/home separated from work/school, and communication, none of which existed as a distinct topic at k=5. The diagnosis topic also sharpens, adding `therapist`.
+
+**Decision: k=8 is selected.** Coherence is nearly identical for k=5 and k=8, but k=8 produces a noticeably richer, more interpretable set of topics.
+
+One pattern persists across both k=5 and k=8: a near-identical "catch-all" topic dominated by `feel, people, time, friend, autistic, autism, day, life, talk, lot`, the same generic, high-frequency words identified but deliberately not removed during preprocessing. This is the evidence that deferred decision was waiting for: revisiting the domain-specific stopword list is the next step, expected to sharpen topic separation further.
+
+## Step 9: Validating topics against post_flair
+
+A topic model is unsupervised; it has no knowledge of `post_flair`. If topics found purely from word co-occurrence align with categories users independently chose when posting, that is external evidence the topics capture real thematic structure rather than noise.
+
+### 9.1: Assigning a dominant topic per document
+
+```{r}
+# Most likely topic for each document (k = 8)
+pred_btm <- predict(modelo_k8, newdata = btm_data)
+
+topic_dominante <- as_tibble(pred_btm, rownames = "doc_id") |>
+  pivot_longer(-doc_id, names_to = "topic", values_to = "prob") |>
+  group_by(doc_id) |>
+  slice_max(prob, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+nrow(topic_dominante)
+n_distinct(topic_dominante$doc_id)
+```
+
+### 9.2: Recovering post_flair
+
+`post_flair` was never carried through the token-level pipeline, so it is joined back in from the EDA's filtered corpus.
+
+```{r}
+# Add each post's flair
+reddit_flairs <- tokens_clean_pruned |>
+  distinct(id) |>
+  left_join(read_csv("reddit_filtered.csv") |> select(id, post_flair), by = "id")
+
+validacion_flair <- topic_dominante |>
+  rename(id = doc_id) |>
+  left_join(reddit_flairs, by = "id")
+
+nrow(validacion_flair)
+sum(is.na(validacion_flair$post_flair))
+```
+
+### 9.3: Checking the 7 missing flairs
+
+```{r}
+# Check the posts with no flair
+ids_sin_flair <- validacion_flair |> filter(is.na(post_flair)) |> pull(id)
+
+read_csv("reddit_filtered.csv") |>
+  filter(id %in% ids_sin_flair) |>
+  mutate(n_chars_title = str_length(title)) |>  # titles are not displayed (post content)
+  select(id, post_flair, n_chars_title)
+```
+
+All 7 posts have a genuinely empty `post_flair` (optional on Reddit; two are literally titled "Test"/"test"), not a join error. **Decision:** these 7 posts are excluded only from the flair validation below; they keep their dominant-topic assignment everywhere else.
+
+### 9.4: How often each topic is actually dominant
+
+```{r}
+# Number of documents where each topic is the main one
+validacion_flair |>
+  count(topic, name = "n_docs_dominante") |>
+  arrange(n_docs_dominante)
+```
+
+Topic V1 is dominant for only 4 of 57,044 documents, essentially none. This is early, concrete evidence for the "catch-all" pattern flagged in Step 8: a topic built from words present a little in every document, but never concentrated enough in any single one to dominate it, is the expected signature of noise rather than a real theme.
+
+### 9.5: Flair concentration per topic, compared to the corpus baseline
+
+Raw top-3 flairs per topic aren't informative on their own: `General Discussion/Question`, `Seeking Advice`, and `Support Needed` are also the three largest flairs overall (~80% of the corpus), so they show up near the top for almost any topic by base rate alone. Each topic's flair percentages are compared against that baseline instead.
+
+```{r}
+# Compare each topic's flair mix with the corpus average
+baseline_flair <- validacion_flair |>
+  filter(!is.na(post_flair)) |>
+  count(post_flair, name = "n_total") |>
+  mutate(pct_base = round(100 * n_total / sum(n_total), 1))
+
+topic_flair_diff <- validacion_flair |>
+  filter(!is.na(post_flair)) |>
+  count(topic, post_flair) |>
+  group_by(topic) |>
+  mutate(pct_topic = round(100 * n / sum(n), 1)) |>
+  ungroup() |>
+  left_join(baseline_flair |> select(post_flair, pct_base), by = "post_flair") |>
+  mutate(diff_pp = round(pct_topic - pct_base, 1)) |>
+  group_by(topic) |>
+  slice_max(pct_topic, n = 3) |>
+  arrange(topic, desc(pct_topic)) |>
+  ungroup()
+
+topic_flair_diff |> select(topic, post_flair, pct_topic, pct_base, diff_pp)
+```
+
+Once compared to baseline, real differentiation appears: V3 skews toward `General Discussion/Question` (+12.2pp), V7 toward `Support Needed` (+10.4pp), and V8 toward `Seeking Advice` (+13.2pp), each meaningfully more concentrated in one flair than average. V5 stays close to baseline across all three (differences of 2-4pp), the least flair-distinctive topic. V1 appears in the table but is not interpreted; with only 4 dominant documents, any percentage would be uninformative.
+
+**Summary:** V3, V7, and V8 are well validated by flair concentration; V2, V4, V6 show moderate differentiation; V5 is weakly differentiated; V1 is effectively noise. This is a second, independent line of evidence pointing toward revisiting domain-specific stopwords before treating this model as final.
+
+## Step 10: Checkpoint before evaluating custom stopwords
+
+Everything through Step 9 (k=8, `window=15`, `iter=200`, no domain stopwords) is backed up before modifying the vocabulary, in case the custom-stopword route isn't adopted after evaluation.
+
+```{r}
+# Copy the v1 files to a backup folder
+dir.create("checkpoint_v1_sin_stopwords_custom", showWarnings = FALSE)
+
+file.copy(
+  from = c(
+    "tokens_clean_pruned.csv",
+    "modelo_btm_k5.rds", "modelo_btm_k8.rds", "modelo_btm_k10.rds",
+    "modelo_btm_k12.rds", "modelo_btm_k15.rds", "modelos_btm_todos.rds"
+  ),
+  to = "checkpoint_v1_sin_stopwords_custom/",
+  overwrite = TRUE
+)
+
+list.files("checkpoint_v1_sin_stopwords_custom")
+```
+
+## Step 11: Identifying domain-specific stopword candidates
+
+Rather than guessing which frequent words are noise, candidates are identified by how many of the k=8 model's 8 topics each word appears in (top 15 words per topic). A word present in most topics is, by construction, not helping tell those topics apart, regardless of how "on-topic" it looks in isolation.
+
+```{r}
+# Count in how many topics each word appears (top 15 words)
+palabras_por_topic <- terms(modelo_k8, top_n = 15)
+
+cross_topic_freq <- bind_rows(
+  lapply(seq_along(palabras_por_topic), function(i) {
+    palabras_por_topic[[i]] |> mutate(topic = i)
+  })
+) |>
+  count(token, name = "n_topics_donde_aparece") |>
+  arrange(desc(n_topics_donde_aparece))
+
+cross_topic_freq |> filter(n_topics_donde_aparece >= 4)
+```
+
+12 words appear in 4 or more of the 8 topics. Frequency alone isn't sufficient justification for removal: `experience`, `friend`, `love`, and `struggle` also appear in 4 topics each, but carry real thematic content (diagnosis experience, relationships, emotional struggle) rather than generic filler. `talk` is ambiguous, could be generic filler or part of a genuine "communication" topic, and is left out of the removal list rather than guessed either way.
+
+**Decision:** `feel` and `time` (present in all 8 topics), `people` (7), `day` and `lot` (6), and `life` and `start` (5) are adopted as `stopwords_custom_v2`. `experience`, `friend`, `love`, `struggle`, and `talk` are kept.
+
+```{r}
+# Domain-specific stopwords
+stopwords_custom_v2 <- c("feel", "time", "people", "day", "lot", "life", "start")
+```
+
+## Step 12: Rebuilding the corpus with domain stopwords applied
+
+```{r}
+# Remove them from the pruned tokens
+tokens_clean_pruned_v2 <- tokens_clean_pruned |>
+  filter(!lemma %in% stopwords_custom_v2)
+
+n_distinct(tokens_clean_pruned$lemma)
+n_distinct(tokens_clean_pruned_v2$lemma)
+```
+
+```{r}
+# Tokens before and after
+nrow(tokens_clean_pruned)
+nrow(tokens_clean_pruned_v2)
+```
+
+```{r}
+# Documents before and after
+n_distinct(tokens_clean_pruned$id)
+n_distinct(tokens_clean_pruned_v2$id)
+```
+
+All 7 words have document frequency far above the Step 2 pruning cutoff, so removing them doesn't interact with that earlier rule.
+
+```{r}
+# Build the BTM input for v2 and save it
+btm_data_v2 <- tokens_clean_pruned_v2 |>
+  rename(doc_id = id, token = lemma) |>
+  filter(!doc_id %in% ids_exclude) |>
+  as.data.frame()
+
+nrow(btm_data_v2)
+n_distinct(btm_data_v2$doc_id)
+
+saveRDS(btm_data_v2, "btm_data_v2.rds")
+```
+
+## Step 13: Fitting BTM (v2) across the same candidate k values
+
+Same fitting logic as Step 6 (`window=15`, `iter=200`, both already validated and unaffected by this vocabulary change), applied to `btm_data_v2` and saved under distinct filenames (`modelo_btm_v2_k*.rds`) so the Step 10 checkpoint is never overwritten.
+
+Same load-or-fit logic as Step 6.
+
+```{r}
+# Fit one BTM per k (v2), or load it if already saved
+modelos_btm_v2 <- list()
+
+for (k in k_candidatos) {
+  archivo_k <- paste0("modelo_btm_v2_k", k, ".rds")
+
+  if (file.exists(archivo_k)) {
+    cat("k =", k, "(v2) ya existe en disco, cargando en vez de re-ajustar...\n")
+    modelo <- readRDS(archivo_k)
+  } else {
+    cat("Ajustando BTM v2 con k =", k, "...\n")
+
+    set.seed(1234)
+    tiempo <- system.time({
+      modelo <- BTM(
+        btm_data_v2, k = k, beta = 0.01, iter = 200, window = 15, background = TRUE
+      )
+    })
+
+    cat("  k =", k, "- tiempo:", tiempo["elapsed"], "segundos\n")
+    saveRDS(modelo, archivo_k)
+  }
+
+  modelos_btm_v2[[paste0("k", k)]] <- modelo
+}
+
+saveRDS(modelos_btm_v2, "modelos_btm_v2_todos.rds")
+```
+
+## Step 14: Coherence across v2's candidate k values
+
+```{r}
+# Coherence for each k (v2)
+dtm_coherence_v2 <- btm_data_v2 |>
+  count(doc_id, token) |>
+  cast_dtm(doc_id, token, n)
+
+resultados_coherencia_v2 <- tibble(
+  k = k_candidatos,
+  coherencia_promedio = map_dbl(k_candidatos, function(k) {
+    modelo <- readRDS(paste0("modelo_btm_v2_k", k, ".rds"))
+    calcular_coherencia_btm(modelo, dtm_coherence_v2)
+  })
+)
+
+# Save the table (also printed below)
+write_csv(resultados_coherencia_v2, "outputs/tables/btm_v2_coherence_by_k.csv")
+
+resultados_coherencia_v2
+```
+
+| k | Coherence v1 (no domain stopwords) | Coherence v2 (domain stopwords removed) |
+|---|---|---|
+| 5 | -93.95 | -117.26 |
+| 8 | -94.29 | -121.84 |
+| 10 | -103.84 | -131.77 |
+| 12 | -104.32 | -131.72 |
+| 15 | -108.08 | -133.61 |
+
+Every k scores worse (more negative) in v2 than in v1, the opposite of what "the cleanup helped" would naively predict. This isn't evidence against the stopword removal: UMass/Mimno coherence is known to be biased toward frequent words, since it divides by how many documents contain each word, so very common words like `feel`/`time` mechanically produce higher scores almost regardless of real semantic coherence. Removing the 7 most frequent words shifts every topic's top words toward rarer, more specific vocabulary, which lowers this metric even when interpretability improves. Comparing raw coherence values across the v1/v2 vocabulary change isn't meaningful; what remains valid is the trend *within* v2, and whether the top words themselves read as more interpretable (assessed qualitatively below).
+
+The within-v2 trend mirrors v1: coherence decreases as k increases, with no meaningful recovery at higher k (k=10 and k=12 differ by 0.05). k=5 (-117.26) and k=8 (-121.84) remain the two least-bad options, but the gap between them (4.58) is larger than in v1 (0.34), still not decisive on its own.
+
+## Step 15: Extending the search, k=6 and k=7
+
+k=5 lacks a distinct meltdown/crisis topic; k=8 captures one but produces three redundant topics all revolving around the same social/relationship theme. Since k=6 and k=7 were never tested, the right balance may sit between the two extremes.
+
+Same load-or-fit logic as Step 6.
+
+```{r}
+# Fit k = 6 and k = 7 (v2), or load them if already saved
+k_candidatos_extra <- c(6, 7)
+modelos_btm_v2_extra <- list()
+
+for (k in k_candidatos_extra) {
+  archivo_k <- paste0("modelo_btm_v2_k", k, ".rds")
+
+  if (file.exists(archivo_k)) {
+    cat("k =", k, "(v2) ya existe en disco, cargando en vez de re-ajustar...\n")
+    modelo <- readRDS(archivo_k)
+  } else {
+    cat("Ajustando BTM v2 con k =", k, "...\n")
+
+    set.seed(1234)
+    tiempo <- system.time({
+      modelo <- BTM(
+        btm_data_v2, k = k, beta = 0.01, iter = 200, window = 15, background = TRUE
+      )
+    })
+
+    cat("  k =", k, "- tiempo:", tiempo["elapsed"], "segundos\n")
+    saveRDS(modelo, archivo_k)
+  }
+
+  modelos_btm_v2_extra[[paste0("k", k)]] <- modelo
+}
+```
+
+## Step 16: Final comparison, k=5, 6, 7, 8 (v2)
+
+Coherence isn't used to decide among these four: it already showed the same downward-with-k trend as v1, and isn't comparable across the v1/v2 vocabulary change. The comparison here is purely qualitative.
+
+```{r}
+# Top words for k = 5 to 8 (v2)
+modelo_v2_k5 <- readRDS("modelo_btm_v2_k5.rds")
+modelo_v2_k6 <- readRDS("modelo_btm_v2_k6.rds")
+modelo_v2_k7 <- readRDS("modelo_btm_v2_k7.rds")
+modelo_v2_k8 <- readRDS("modelo_btm_v2_k8.rds")
+
+resumen_v2_k5 <- resumen_topics(modelo_v2_k5) |> mutate(modelo = "v2, k = 5", .before = topic)
+resumen_v2_k6 <- resumen_topics(modelo_v2_k6) |> mutate(modelo = "v2, k = 6", .before = topic)
+resumen_v2_k7 <- resumen_topics(modelo_v2_k7) |> mutate(modelo = "v2, k = 7", .before = topic)
+resumen_v2_k8 <- resumen_topics(modelo_v2_k8) |> mutate(modelo = "v2, k = 8", .before = topic)
+
+topics_v2_k5_k8 <- bind_rows(resumen_v2_k5, resumen_v2_k6, resumen_v2_k7, resumen_v2_k8)
+
+# Save the table (also printed below)
+write_csv(topics_v2_k5_k8, "outputs/tables/btm_v2_top_words_k5_k8.csv")
+
+topics_v2_k5_k8
+```
+
+| k | Clearly distinct topics | Redundant topics | Captures meltdown/crisis? |
+|---|---|---|---|
+| 5 | 4 of 5 | 0 | No |
+| 6 | 5 of 6 | 0 | Yes |
+| 7 | 5 of 7 | 2 (both "work/home/logistics") | Yes |
+| 8 | 5 of 8 | 3 (all social/relationship) | Yes |
+
+k=7 relocates the same kind of redundancy seen at k=8 to a different pair of topics (daily-life logistics instead of social/relationships) rather than resolving it, no real improvement over k=8. k=6 is the only value tested where a distinct meltdown/crisis topic is captured with zero redundant topic pairs.
+
+**Decision: k=6 is adopted as the final BTM model**, superseding the k=8 selection from Step 8, which was made before the domain-stopword revision and before k=6/k=7 were tested.
+
+```{r}
+# Save the final model (k = 6)
+modelo_final_btm <- modelo_v2_k6
+saveRDS(modelo_final_btm, "modelo_final_btm.rds")
+```
+
+## Step 17: Confirming V1 is residual noise, not a genuine topic
+
+Model selection is closed as of Step 16 (k=6). This step only
+establishes, on the model actually carried forward, why V1 is treated
+as residual rather than substantively interpreted. Flair-based
+external validation of the five substantive topics (V2-V6) is done
+separately, in the interpretation stage, not repeated here; this
+section is about the model's own behavior (topic probabilities), not
+about validating meaning against an external label.
+
+### 17.1: Assigning a dominant topic per document
+
+```{r}
+# Most likely topic for each document (final model); save it
+pred_btm_final <- predict(modelo_final_btm, newdata = btm_data_v2)
+
+topic_dominante_final <- as_tibble(pred_btm_final, rownames = "doc_id") |>
+  pivot_longer(-doc_id, names_to = "topic", values_to = "prob") |>
+  group_by(doc_id) |>
+  slice_max(prob, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+nrow(topic_dominante_final)
+n_distinct(topic_dominante_final$doc_id)
+
+saveRDS(topic_dominante_final, "topic_dominante_final.rds")
+```
+
+### 17.2: The 3 additional documents lost to domain stopword removal
+
+`btm_data_v2` has 3 fewer documents than `btm_data` (57,041 vs. 57,044), checked directly rather than assumed.
+
+```{r}
+# Find the 3 documents lost to the domain stopwords
+ids_perdidos_stopwords <- setdiff(unique(btm_data$doc_id), unique(btm_data_v2$doc_id))
+
+read_csv("reddit_filtered.csv") |>
+  filter(id %in% ids_perdidos_stopwords) |>
+  mutate(n_chars_text = str_length(text)) |>  # text is not displayed (post content)
+  select(id, post_flair, n_chars_text)
+```
+
+All 3 are short posts whose lemmatized content was dominated by words now in `stopwords_custom_v2`; in one of them, `feel` was most of its substantive vocabulary. Expected and explainable, not an error.
+
+### 17.3: Testing whether V1 is a genuine diffuse topic or residual noise
+
+If V1 were a real but broad theme that frequently loses to more specific topics, it should still carry moderate probability across many documents even when not dominant. If it's residual noise, its probability should stay low almost everywhere.
+
+```{r}
+# Average V1 probability and share of documents with V1 above 0.2
+as_tibble(pred_btm_final, rownames = "doc_id") |>
+  pivot_longer(-doc_id, names_to = "topic", values_to = "prob") |>
+  filter(topic == "V1") |>
+  summarise(
+    prob_promedio = mean(prob),
+    pct_docs_con_prob_mayor_20 = mean(prob > 0.2) * 100
+  )
+```
+
+Average probability (0.123) is below what uniform chance across 6 topics would give (1/6 ≈ 0.167), and only 0.10% of documents give V1 any meaningful secondary weight (probability > 0.2). This rules out the "genuine diffuse topic" explanation; the pattern matches residual noise, not a real theme competing and losing.
+
+### 17.4: Manual inspection of the 5 documents where V1 dominates
+
+IDs are pulled directly from `topic_dominante_final`.
+`post_flair` appears below only to show that these 5 documents are
+spread across different flair categories, one more sign of an
+incoherent grab-bag, not a validation of what V1 "means".
+
+```{r}
+# The 5 documents where V1 dominates
+ids_v1 <- topic_dominante_final |> filter(topic == "V1") |> pull(doc_id)
+
+read_csv("reddit_filtered.csv") |>
+  filter(id %in% ids_v1) |>
+  select(id, post_flair)  # text is not displayed (post content)
+```
+
+The 5 documents span 4 different `post_flair` categories (two share one) and unrelated content (impostor syndrome, anger about living conditions, perimenopause, shame trying new things, unemployment), no shared theme. This is a third independent line of evidence that V1 functions as a catch-all for posts that don't fit clearly elsewhere, not as a genuine topic. The description of their content comes from reading these posts; their text is not shown here, so the rendered report does not reproduce it.
+
+**Conclusion:** k=6 remains the final model, but only V2 through V6 (5 topics) are treated as substantively interpretable in the thesis narrative. V1 is documented and reported as a residual, non-thematic component, with the evidence above cited as justification, not silently dropped. Flair-based validation of V2-V6 is carried out in the interpretation stage, using the files saved in Step 18.
+
+## Step 18: Files saved from this document
+
+Three files carry the results of this document forward, and none of them contains post text: `modelo_final_btm.rds` (Step 16), `topic_dominante_final.rds` (Step 17.1) and `id_flair.csv`, created here with the id and flair of each post.
+
+```{r}
+# Save post id + flair (no text)
+read_csv("reddit_filtered.csv") |>
+  select(id, post_flair) |>
+  filter(id %in% topic_dominante_final$doc_id) |>
+  write_csv("outputs/tables/id_flair.csv")
+```

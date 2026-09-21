@@ -1,0 +1,229 @@
+---
+title: "MTh - Preprocessing pipeline for the scientific literature corpus"
+subtitle: "Text cleaning, tokenization, stopword removal and lemmatization"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+## Introduction
+
+This document builds the preprocessing pipeline applied to the literature corpus produced at the end of the EDA: 16 papers, references and appendices already excluded, saved as `literature_corpus_clean.rds`. It covers tokenization, stopword removal, and lemmatization, and produces the token table used to build the document-term matrix for LDA.
+
+Lemmatization uses `udpipe`, which needs case and punctuation to tokenize and POS-tag correctly, so it runs on lightly-cleaned text, not on a heavily-normalized version. Lowercasing and stopword filtering happen *after* lemmatization, on the resulting lemma column.
+
+**Note:** the udpipe model (`english-ewt-ud-2.5-191206`) is downloaded automatically if it is not in the project folder.
+
+```{r}
+# Load packages
+library(tidyverse)
+library(tidytext)
+library(udpipe)
+```
+
+## Step 1: Loading the cleaned corpus
+
+```{r}
+# Read the cleaned corpus from the EDA
+literature_corpus <- readRDS("literature_corpus_clean.rds")
+
+paper_id    <- literature_corpus$paper_id
+doc_summary <- literature_corpus$doc_summary
+body_text   <- literature_corpus$body_text
+
+length(body_text)
+```
+
+## Step 2: Publisher boilerplate at the start of each document
+
+`body_text` starts with the real title, part of the analysis text along with the abstract and body, per the corpus definition. But the EDA's column-reordering pipeline pulled in journal metadata (DOI, article type, "Open Access", volume/issue, editor/reviewer names) that sits alongside the title on a page with a more complex layout than plain two-column body text. That metadata ends up interleaved with the title itself, which makes it unreliable to cut at an exact anchor. We tried matching the known title text, then an "Abstract" heading, and both broke on a handful of papers with different journal formats: some journals never print an "Abstract" label, and Frontiers papers interleave "EDITED BY"/"REVIEWED BY" boxes with the author list.
+
+Rather than chase a perfect per-journal cut, we measured whether this boilerplate is even a real risk for the topic model: counted how many of the 16 papers each word in the first 300 characters appears in.
+
+```{r}
+# In how many papers does each word of the first 300 characters appear?
+header_zone <- map_chr(body_text, ~ str_sub(.x, 1, 300))
+
+header_words_by_doc <- map(header_zone, function(txt) {
+  words <- str_extract_all(str_to_lower(txt), "[a-z]+")[[1]]
+  unique(words[str_length(words) > 2])
+})
+names(header_words_by_doc) <- paper_id
+
+all_header_words <- unique(unlist(header_words_by_doc))
+doc_freq_header <- map_int(all_header_words, function(w) {
+  sum(map_lgl(paper_id, ~ w %in% header_words_by_doc[[as.character(.x)]]))
+})
+
+tibble(word = all_header_words, doc_frequency = doc_freq_header) |>
+  arrange(desc(doc_frequency)) |>
+  print(n = 20)
+```
+
+Most high-frequency words here are legitimate content: `women`, `autistic`, `autism`, `research`, `experiences`, which makes sense since the title is real analysis text. But a clear second group is publisher boilerplate: `article` (8/16), `doi` (7/16), `access` (6/16), `original` (5/16), `author` (5/16), `com`/`journals`/`open` (5/16 each), `vol`/`reuse`/`guidelines`/`sagepub` (4/16 each), and `permissions`/`published` (3/16). These frequencies are too high to be pruned out by document-frequency filtering later, the same issue as the statistical notation found in the EDA (Step 1.6).
+
+**Decision:** handle this the same way as the statistical notation: a domain-specific stopword list, applied after lemmatization, rather than a fragile per-document text cut.
+
+```{r}
+stopwords_custom_literature <- c(
+  # journal/publisher boilerplate (doc_frequency 2-8 out of 16, measured below)
+  "article", "doi", "access", "original", "author", "com", "journals",
+  "open", "vol", "reuse", "guidelines", "sagepub", "permissions",
+  "published", "https", "org", "online",
+  # statistical notation (from EDA Step 1.6)
+  "m", "sd", "f", "p", "ci", "se", "d", "t", "df", "or", "r"
+)
+```
+
+The document frequency of each publisher word in that list, measured in the same first 300 characters, is shown below (out of 16 papers).
+
+```{r}
+# Document frequency of each publisher boilerplate word in the stopword list
+boilerplate_words <- c(
+  "article", "doi", "access", "original", "author", "com", "journals",
+  "open", "vol", "reuse", "guidelines", "sagepub", "permissions",
+  "published", "https", "org", "online"
+)
+
+tibble(word = all_header_words, doc_frequency = doc_freq_header) |>
+  filter(word %in% boilerplate_words) |>
+  arrange(desc(doc_frequency), word)
+```
+
+## Step 3: Lemmatization
+
+The `upos` filter keeps `NOUN, VERB, ADJ, ADV, PROPN`, as explained below. No need to parallelize; 16 documents annotate in seconds.
+
+```{r}
+# Download the English model once if it is not in the project folder
+udmodel_file <- "english-ewt-ud-2.5-191206.udpipe"
+if (!file.exists(udmodel_file)) {
+  udpipe_download_model(language = "english-ewt", model_dir = ".",
+                        udpipe_model_repo = "jwijffels/udpipe.models.ud.2.5")
+}
+
+# Load the model and annotate the 16 papers
+udmodel <- udpipe_load_model(file = udmodel_file)
+
+annotation <- udpipe_annotate(
+  udmodel,
+  x = body_text,
+  doc_id = names(body_text)
+) |> as.data.frame()
+
+nrow(annotation)
+```
+
+```{r}
+# Count tokens by part of speech
+annotation |>
+  count(upos, sort = TRUE) |>
+  mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+The `upos` distribution above guides which categories to keep. Nouns, verbs, adjectives, adverbs and proper nouns are content words: they name things, actions, qualities and manner, so their presence changes with the subject of each paper, and they are kept. Pronouns, auxiliaries, prepositions, determiners, conjunctions and particles do grammatical work and appear in every paper, so they cannot separate one theme from another; together they make up about 28% of the tokens. `PUNCT` is dropped because punctuation marks are not words, `NUM` and `SYM` because numbers and symbols (sample sizes, statistics) say little about a paper's subject on their own, `X` because it holds unclassified tokens, and `INTJ` because interjections express reactions rather than subjects. `PROPN` is kept because proper nouns can name instruments, software or conditions with topical content, although it also lets some author surnames through.
+
+Filtering by `upos`, lowercasing, and removing stopwords (standard plus domain-specific from Step 2).
+
+```{r}
+# Keep content words (POS filter), lowercase, remove standard and domain stopwords
+tokens_lemmatized <- annotation |>
+  filter(upos %in% c("NOUN", "VERB", "ADJ", "ADV", "PROPN")) |>
+  select(paper_id = doc_id, lemma) |>
+  mutate(lemma = str_to_lower(lemma))
+
+tokens_clean <- tokens_lemmatized |>
+  anti_join(stop_words, by = c("lemma" = "word")) |>
+  filter(!lemma %in% stopwords_custom_literature) |>
+  filter(str_length(lemma) > 2)
+
+nrow(tokens_lemmatized)
+```
+
+```{r}
+# Tokens after stopword removal
+nrow(tokens_clean)
+```
+
+Sanity check: confirm the domain stopwords actually got removed, and take a first look at the resulting vocabulary.
+
+```{r}
+# Check that the domain stopwords are gone
+tokens_clean |>
+  filter(lemma %in% c("m", "sd", "f", "p", "article", "doi", "sagepub")) |>
+  nrow()
+```
+
+```{r}
+# Top 20 lemmas
+tokens_clean |>
+  count(lemma, sort = TRUE) |>
+  head(20)
+```
+
+0 residual matches, and the top-20 lemmas are clean, on-topic vocabulary: "autistic", "woman", "autism", "diagnosis", "anxiety", and so on. No boilerplate, no statistical notation.
+
+```{r}
+# Save the token table (derived from the paper texts: kept local)
+write_csv(tokens_clean, "tokens_clean_lemmatized_literature.csv")
+
+# Also save the full annotation (not just the filtered tokens). It keeps the
+# part-of-speech tag of every token, which allows checking whether a PROPN-tagged
+# term ever appears as a common word elsewhere in the corpus. It contains the
+# sentences of the papers, so it is kept local
+saveRDS(annotation, "annotation_literatura.rds")
+```
+
+## Step 4: Vocabulary pruning: decision
+
+Discarding terms that appear in very few documents is a common way to remove noise (typos, artifacts) while losing little text volume. Whether that works depends on the corpus. This one is 16 heterogeneous papers, each covering a different sub-topic (Pap smears, GRADE-CERQual methodology, eating disorders…), so a term appearing in a single document is often real, topic-specific vocabulary for that paper, not noise.
+
+```{r}
+# In how many papers does each lemma appear?
+vocab_doc_freq <- tokens_clean |>
+  distinct(paper_id, lemma) |>
+  count(lemma, name = "doc_frequency")
+
+n_distinct(tokens_clean$lemma)
+```
+
+```{r}
+# Number of lemmas by document frequency
+table(vocab_doc_freq$doc_frequency)
+```
+
+60% of lemmas (4,154 of 6,896) appear in only one document. Checking how much token *volume*, not just vocabulary size, would be lost at each possible cutoff:
+
+```{r}
+# Vocabulary and token volume kept at each minimum document frequency
+tibble(min_doc_freq = 1:8) |>
+  rowwise() |>
+  mutate(
+    lemmas_kept = sum(vocab_doc_freq$doc_frequency >= min_doc_freq),
+    pct_vocab_kept = round(100 * lemmas_kept / nrow(vocab_doc_freq), 1),
+    tokens_kept = sum(tokens_clean$lemma %in%
+                       vocab_doc_freq$lemma[vocab_doc_freq$doc_frequency >= min_doc_freq]),
+    pct_volume_kept = round(100 * tokens_kept / nrow(tokens_clean), 1)
+  ) |>
+  ungroup()
+```
+
+Even the mildest possible cut, discarding terms that appear in only 1 document, already loses 11.9% of total token volume, and the loss grows quickly with the cutoff (40% of the volume at a cutoff of 8). No threshold here removes noise while preserving most of the volume.
+
+**Decision:** no document-frequency pruning. `tokens_clean` is the final, unpruned vocabulary.
+
+```{r}
+# Final size of the token table
+tokens_clean |>
+  summarise(n_tokens = n(), n_lemmas = n_distinct(lemma), n_papers = n_distinct(paper_id))
+```

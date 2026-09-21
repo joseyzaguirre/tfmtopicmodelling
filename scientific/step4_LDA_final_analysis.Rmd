@@ -1,0 +1,340 @@
+---
+title: "MTh - Interpretation of results: scientific literature corpus"
+subtitle: "Continues from the LDA topic modelling document (k=6 final)"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Context
+
+This document continues directly from the end of the LDA topic
+modelling document. The EDA, preprocessing, and k selection are closed
+and are not revisited here; this document starts from the final LDA
+model (k=6) and focuses on interpretation: naming topics from their top
+words and identifying representative papers per topic.
+
+Methodology: evidence before assumption, each interpretive claim backed
+by top words, document-level evidence, or the papers' own titles, not
+by intuition alone.
+
+`autistic`/`autism` are treated as anchor terms throughout: present
+near the top of every topic by corpus design (the inclusion criterion
+for all 16 papers), not because they carry discriminating signal. They
+are kept in the model and in every table/figure below (removing them
+would mean rebuilding the DTM and re-running k selection, out of scope
+here); they are simply not used to name topics, and are visually
+flagged as anchors in Figure 1.
+
+**Note:** the interpretation runs from the two tables saved by the LDA document, without the model object or any article text. Tables and figures are saved in `outputs/`.
+
+## Libraries
+
+```{r libraries}
+# Load packages
+library(tidyverse)
+library(tidytext)
+library(ggplot2)
+library(kableExtra)
+```
+
+```{r output-folders}
+# Folders for the tables and figures saved by this document
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Loading the final model tables
+
+This document starts from two tables saved at the end of the LDA topic
+modelling document (Step 2.4): `lda_final_beta.csv` (probability of each
+term in each topic) and `lda_final_gamma.csv` (share of each topic in
+each paper).
+
+```{r load-tables}
+# Load the topic-term (beta) and paper-topic (gamma) tables of the final model
+beta_tbl  <- read_csv("outputs/tables/lda_final_beta.csv")
+gamma_tbl <- read_csv("outputs/tables/lda_final_gamma.csv")
+
+count(beta_tbl, topic)
+n_distinct(gamma_tbl$document)
+```
+
+## Step 1: Top terms per topic
+
+Reporting cutoff fixed at n=10, as in Step 2.3 of the LDA document and
+the usual convention for LDA reporting.
+
+```{r top-terms}
+# Top 10 terms per topic
+top_terms <- beta_tbl |>
+  group_by(topic) |>
+  slice_max(beta, n = 10) |>
+  arrange(topic, desc(beta)) |>
+  summarise(top_terms = paste(term, collapse = ", "), .groups = "drop")
+
+# Save the table (also shown below)
+write_csv(top_terms, "outputs/tables/lda_top_terms_n10.csv")
+
+knitr::kable(top_terms) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 12)
+```
+
+### Step 1b: Robustness check (n=15, not for reporting)
+
+Extending past the n=10 cutoff only to check whether noise (citation
+surnames, structural artifacts like "manuscript", "table", "figure",
+"doi", "supplementary") shows up just past the reporting window. If it
+does, that topic gets labeled more cautiously even though its top-10
+looks clean. This table is a validation step, not something that goes
+in the TFM.
+
+Topic 3 shows `hampton` (a cited author's surname) and
+`manuscript` at positions 14-15, past the reporting cutoff. Label that
+topic with extra caution.
+
+```{r top-terms-check}
+# Top 15 terms per topic, as a robustness check
+top_terms_check <- beta_tbl |>
+  group_by(topic) |>
+  slice_max(beta, n = 15) |>
+  arrange(topic, desc(beta)) |>
+  summarise(top_terms_15 = paste(term, collapse = ", "), .groups = "drop")
+
+knitr::kable(top_terms_check) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 12)
+```
+
+### Figure 1: Top terms per topic, anchors highlighted
+
+```{r fig-top-terms}
+# Figure 1: top 10 terms per topic
+top_terms_plot <- beta_tbl |>
+  group_by(topic) |>
+  slice_max(beta, n = 10) |>
+  ungroup() |>
+  mutate(
+    is_anchor = term %in% c("autistic", "autism"),
+    term = reorder_within(term, beta, topic)
+  )
+
+fig_top_terms <- ggplot(top_terms_plot, aes(beta, term, fill = is_anchor)) +
+  geom_col(show.legend = TRUE) +
+  facet_wrap(~ topic, scales = "free_y", ncol = 3) +
+  scale_y_reordered() +
+  scale_fill_manual(
+    values = c(`TRUE` = "grey70", `FALSE` = "#2c7fb8"),
+    labels = c(`TRUE` = "Anchor term (present across all topics)", `FALSE` = "Discriminating term"),
+    name = NULL
+  ) +
+  labs(title = "Top 10 terms per topic (LDA, k = 6)", x = expression(beta), y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+ggsave("outputs/figures/fig1_top_terms.png", fig_top_terms, width = 9, height = 6, dpi = 300)
+
+fig_top_terms
+```
+
+## Step 2: Document-topic assignment (gamma)
+
+Which papers dominate each topic (`gamma > 0.5`), to anchor labels in
+actual documents rather than in word lists alone.
+
+Note: gamma values in this corpus are extreme (almost all > 0.95, most
+> 0.9999), meaning topic membership is close to binary rather than
+mixed, likely a consequence of the small corpus (16 papers, 6 topics).
+The one exception is paper 4 (gamma = 0.787 in topic 1), which shows
+some genuine mixture; worth a closer look before treating it as a
+clean topic-1 case.
+
+```{r gamma-assignment}
+# Dominant topic of each paper
+doc_topic <- gamma_tbl |>
+  group_by(document) |>
+  slice_max(gamma, n = 1, with_ties = FALSE) |>
+  arrange(topic, desc(gamma))
+
+# Save the table (also printed below)
+write_csv(doc_topic, "outputs/tables/lda_doc_topic.csv")
+
+doc_topic
+```
+
+### Figure 2: Topic membership per paper (gamma, stacked)
+
+```{r fig-gamma-stacked}
+# Figure 2: topic membership per paper
+gamma_matrix <- gamma_tbl |>
+  mutate(
+    document = factor(as.integer(document), levels = sort(unique(as.integer(document)))),
+    topic = factor(topic)
+  )
+
+fig_gamma_stacked <- ggplot(gamma_matrix, aes(x = document, y = gamma, fill = topic)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Topic membership per paper (gamma), LDA k = 6",
+
+    x = "Paper ID", y = "Proportion of topic membership", fill = "Topic"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave("outputs/figures/fig2_gamma_stacked.png", fig_gamma_stacked, width = 9, height = 6, dpi = 300)
+
+fig_gamma_stacked
+```
+
+## Reference: Paper titles (supporting evidence)
+
+Full titles for the 16 papers in the final corpus, used below as
+supporting evidence alongside gamma and top words. The analysis text of
+each paper is its title, abstract and body, so the words of the title
+were part of the input to the model, together with the rest of the
+paper. A match between a title and a topic's top words is therefore a
+consistency check, not independent validation: it shows that the topic
+reflects what the paper says about itself. A title is a small part of
+the text (6 to 28 words in a text of roughly 4,000 to 13,000), so it is
+used here to identify what each dominant paper is about.
+
+```{r paper-titles}
+# Full titles of the 16 papers (supporting evidence)
+paper_titles <- tribble(
+  ~paper_id, ~title,
+  1,  "Overlapping And Differentiating Clinical Features of Autism and Borderline Personality Disorder in Women and People Assigned Female at Birth: A Cross-Sectional Study",
+  2,  "Navigating Residual Diagnostic Categories: The Lived Experiences of Women Diagnosed with Autism and ADHD in Adulthood",
+  3,  "Disability Barriers Autistic Girls Face in Secondary Education: A Systematic Review",
+  4,  "The Healthcare Experiences of Middle and Older Age Autistic Women in the United Kingdom",
+  5,  "Autistic Women's Experiences of Interpersonal Violence",
+  6,  "A Good Autistic Life: An Autistic-Led Conceptualization of Autistic Flourishing Through Autistic Women's Lived Experiences",
+  7,  "Autistic Women's Maternal Health: A Review of the Literature on Prenatal, Birth, and Postpartum Experiences for Autistic Mothers",
+  8,  "Autistic Women Report High Levels of Pain, Pain-Related Anxiety, and Pain Interference",
+  9,  "The Impact of Intersectional Disadvantage on Autistic Women's Experiences of Interpersonal Violence: A Narrative Review",
+  11, "\"I ask them what autism means for them\": A Qualitative Study of Staff Experiences of Working with Autistic Women and Birthing People in Community Perinatal Mental Health Teams",
+  12, "Comparative Analysis of Autistic Women Across the Lifespan: Childhood vs. Adulthood Diagnosis",
+  13, "Underdiagnosed and Misunderstood: Clinical Challenges and Educational Needs of Healthcare Professionals in Identifying Autism Spectrum Disorder in Women",
+  14, "The Association Between Autism, Camouflaging and Anxiety with Suicidal Ideation in Women",
+  15, "Diagnostic Challenges of Autism Spectrum Disorder in Women Without Intellectual or Language Impairments: A Narrative Review",
+  16, "Eating Behaviors of Autistic Women with an Eating Disorder",
+  17, "'I Fit the Category of the Box, It Just Doesn't Describe Me Well.' Exploring the Perspectives of Autistic Women and Gender-Diverse Individuals on Self-Report Autism Measures"
+)
+
+knitr::kable(paper_titles) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 12)
+```
+
+## Step 3: Topic labeling
+
+Evidence strength varies across topics, kept visible rather than
+smoothed over. There is no external label for the papers in this
+corpus, so paper titles are used as supporting evidence: a title is a
+short summary of the paper's subject, and when it matches a topic's top
+words it supports the label. Because the title is part of the text the
+model used, this is a consistency check, not independent validation.
+
+`autistic`/`autism` are anchor terms throughout, present by corpus
+design, not used to justify any label below.
+
+**Topic 1: Autistic women across the lifespan: healthcare &
+diagnosis.** Top words (experience, social, study, participant, girl,
+woman, bpd, healthcare, school, research) span three different papers
+rather than one clean theme. Two of the three titles point to a shared
+thread: paper 3 is about autistic girls in secondary school, paper 4
+about older autistic women in healthcare, together suggesting age as a
+connecting idea across the lifespan. The third, paper 1, is about
+telling autism apart from BPD, unrelated to age; it's grouped here by
+shared vocabulary, not a shared topic. The label names the age pattern
+where it actually holds (2 of 3 papers), not all three. Paper 4 is
+also the only paper in the whole corpus with real topic mixture rather
+than a clean assignment, worth keeping in mind.
+
+**Topic 2: Diagnostic processes & health support systems.** Top words
+(diagnose, participant, adhd, health, diagnosis, support, research,
+mental, individual, service) are supported by titles across the topic,
+though from two angles rather than one. Paper 2 (ADHD/autism diagnosis
+in adulthood) and paper 12 (childhood vs. adulthood diagnosis
+comparison) are squarely about the diagnostic process itself. Paper
+11, titled around healthcare staff's experience in perinatal mental
+health teams, sits on the other side of the same system: diagnosis
+doesn't happen in isolation, it's mediated by healthcare professionals
+and support services, which is plausibly where
+`mental`/`service`/`support` come from.
+
+**Topic 3: Mental health risk and female autism experiences.** Top
+words (suicidal, ideation, anxiety, camouflaging, non-autistic,
+mother) match paper 14's title directly (camouflaging, anxiety, and
+suicidal ideation). Paper 7, the other dominant paper, is titled
+around prenatal, birth, and postpartum experiences in autistic women,
+which is where `mother` comes from. The connection between the two
+papers may be precisely that: the experiences paper 7 addresses and
+the symptoms or experiences paper 14 refers to.
+
+**Topic 4: Diagnostic criteria challenges and gender differences.**
+Top words (diagnostic, social, gender, female, participant,
+experience, trait, study, individual, measure) are supported by
+three dominant titles. Paper 15 and paper 13 are squarely about
+diagnostic challenges for women. Paper 17, on perspectives around
+self-report autism measures, fits the same theme from another angle:
+self-report instruments are themselves part of the diagnostic process,
+and a paper exploring their limits for autistic women and gender-
+diverse people. The gender angle across all three plausibly points to
+the same underlying issue: diagnostic criteria and measurement tools
+that may or may not account well enough for how autism presents
+differently across genders.
+
+**Topic 5: Trauma experiences.** Top words (violence, wbp, behavior,
+eat, interpersonal, report); `wbp` was confirmed as "women and birthing
+people" by checking the source text directly. All three dominant
+papers' titles support the topic directly: paper 5 and paper 9 are
+both explicitly about autistic women's experiences of interpersonal
+violence, and paper 16 is explicitly about eating behaviors/disorders
+in autistic women. Interpersonal violence and disordered eating are
+treated here as two expressions of the same underlying category,
+trauma.
+
+**Topic 6: Wellbeing and adversity symptoms.** Top words (pain,
+anxiety, flourishing, describe, feel, neurotypical, study, woman,
+life, analysis, social, related) can be read around how autistic
+women experience life day to day, in relation to the world around
+them. `social` and `neurotypical` may suggest a relational framing:
+experience isn't described in isolation, but in contrast with others.
+`pain`, `anxiety`, `feel`, and `life` may point to the everyday reality
+of that experience; at the same time, `flourishing` can appear as one
+possibility within that reality.
+
+## Reference: Topic labels (final summary)
+
+Manual table, not derived from any calculation, this is the outcome of
+the labeling discussion above (top words + paper titles),
+provided here as a quick-reference summary after the full reasoning
+per topic.
+
+```{r topic-labels-table}
+# Manual table with the label of each topic
+topic_labels <- tribble(
+  ~topic, ~label,
+  1, "Autistic women across the lifespan: healthcare & diagnosis",
+  2, "Diagnostic processes & health support systems",
+  3, "Mental health risk and female autism experiences",
+  4, "Diagnostic criteria challenges and gender differences",
+  5, "Trauma experiences",
+  6, "Wellbeing and adversity symptoms"
+)
+
+# Save the table (also shown below)
+write_csv(topic_labels, "outputs/tables/lda_topic_labels.csv")
+
+knitr::kable(topic_labels, col.names = c("Topic", "Label")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 13)
+```

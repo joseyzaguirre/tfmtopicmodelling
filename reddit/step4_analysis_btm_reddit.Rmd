@@ -1,0 +1,303 @@
+---
+title: "MTh - Interpretation of results: r/AutismInWomen corpus"
+subtitle: "Continues from the topic modelling document (Step 16, k=6 final)"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Context
+
+This document continues directly from the end of the topic modelling
+document (`step3_topicmodelling_reddit_lemmatizedcorpus.Rmd`).
+Preprocessing, vocabulary pruning, and k selection (k=6, v2, domain
+stopwords removed) are closed and are not revisited here. Step 17 of
+that document already justified, on the
+model's own behavior, why V1 is residual noise rather than a genuine
+topic (probability below chance, no meaningful secondary weight,
+5 dominant documents with no shared theme, spread across different flairs); that reasoning is
+not repeated here, only assumed.
+
+This document starts from three files saved at the end of the topic
+modelling document, none of which contains post text:
+
+- `modelo_final_btm.rds`: the final BTM model (k=6, v2), saved in Step 16.
+- `topic_dominante_final.rds`: dominant topic per document, saved in
+  Step 17.1 (no flair attached yet; that join happens here, as part of
+  interpretation, not inherited from the previous document).
+- `id_flair.csv`: post id and `post_flair`, saved in Step 18.
+
+Only V2 through V6 (5 topics) are treated as substantively
+interpretable; V1 is shown in the reference table for completeness but
+excluded from the flair-based figures below, and never used to name a
+theme. In the write-up (Step 4), V1-V6 are referred to as Topic 1
+through Topic 6 (dropping the "V" prefix), so numbering in the running
+text matches the tables/figures 1-for-1, with Topic 1 corresponding to
+the residual, non-interpreted component.
+
+**Note:** the flair of each post is read from `id_flair.csv` (post id and flair only), which avoids loading the full corpus, so this document runs without any post text. Table 1 and Figures 1 and 2 are saved in `outputs/`, together with the numbers behind Figure 2.
+
+## Libraries
+
+```{r libraries}
+# Load packages
+library(tidyverse)
+library(tidytext)
+library(BTM)
+library(kableExtra)
+```
+
+```{r output-folders}
+# Folders for the tables and figures saved by this document
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Loading the saved files
+
+```{r load-files}
+# Load the final model and the dominant topic per document
+modelo_final_btm <- readRDS("modelo_final_btm.rds")
+topic_dominante_final <- readRDS("topic_dominante_final.rds")
+
+modelo_final_btm
+nrow(topic_dominante_final)
+```
+
+## Step 1: Joining post_flair (external validation, done here)
+
+```{r join-flair}
+# Add each post's flair and count posts with no flair
+validacion_flair_final <- topic_dominante_final |>
+  rename(id = doc_id) |>
+  left_join(read_csv("outputs/tables/id_flair.csv"), by = "id")
+
+nrow(validacion_flair_final)
+sum(is.na(validacion_flair_final$post_flair))
+```
+
+## Step 2: Top terms per topic
+
+Reporting cutoff fixed at n=10, the usual convention for reporting
+top terms.
+
+```{r top-terms}
+# Top 10 words per topic (function reused for the n = 15 check below)
+resumen_topics <- function(modelo, top_n = 10) {
+  terms_list <- terms(modelo, top_n = top_n)
+  map_dfr(seq_along(terms_list), function(i) {
+    tibble(topic = paste0("V", i), top_10_words = paste(terms_list[[i]]$token, collapse = ", "))
+  })
+}
+
+top_terms <- resumen_topics(modelo_final_btm, top_n = 10)
+top_terms
+```
+
+### Step 2b: Robustness check (n=15, not for reporting)
+
+```{r top-terms-check}
+# Top 15 words per topic, as a robustness check
+top_terms_check <- resumen_topics(modelo_final_btm, top_n = 15) |>
+  rename(top_15_words = top_10_words)
+
+top_terms_check
+```
+
+## Step 3: Results section outputs (table + figures)
+
+This section has three pieces: a table and two figures. No
+`topic_labels` table is built here; the labels are given in prose in
+Step 4.
+
+### Table 1: Topic summary
+
+```{r topic-summary-table}
+# Table 1: top words and number of dominant documents per topic
+n_dominant <- validacion_flair_final |>
+  count(topic, name = "n_dominant_docs")
+
+topic_summary <- top_terms |>
+  left_join(n_dominant, by = "topic") |>
+  mutate(status = if_else(topic == "V1", "Residual (not interpreted)", "Substantive"))
+
+# Save the table (also shown below)
+write_csv(topic_summary, "outputs/tables/table1_topic_summary.csv")
+
+knitr::kable(topic_summary) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    font_size = 13
+  ) |>
+  column_spec(2, width = "50%")
+```
+
+### Figure 1: Top terms per topic, V1 flagged as residual
+
+```{r fig-top-terms}
+# Figure 1: top 10 words per topic
+top_terms_plot <- terms(modelo_final_btm, top_n = 10) |>
+  imap_dfr(~ .x |> mutate(topic = paste0("V", .y))) |>
+  mutate(
+    is_residual = topic == "V1",
+    token = reorder_within(token, probability, topic)
+  )
+
+fig_top_terms <- ggplot(top_terms_plot, aes(probability, token, fill = is_residual)) +
+  geom_col(show.legend = TRUE) +
+  facet_wrap(~ topic, scales = "free_y", ncol = 3) +
+  scale_y_reordered() +
+  scale_fill_manual(
+    values = c(`TRUE` = "grey70", `FALSE` = "#2c7fb8"),
+    labels = c(`TRUE` = "V1: residual, not interpreted", `FALSE` = "Substantive topic"),
+    name = NULL
+  ) +
+  labs(title = "Top 10 terms per topic (BTM, k = 6)", x = "Probability", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+ggsave("outputs/figures/fig1_top_terms.png", fig_top_terms, width = 9, height = 6, dpi = 300)
+
+fig_top_terms
+```
+
+### Figure 2: Topic composition within each flair (external validation)
+
+This answers the more useful question for validation: given a flair a user
+picked independently of the model, what share of posts with that flair
+fall into each topic? V1 is excluded (5 dominant documents total,
+<0.01% of the corpus, would be an invisible or noisy sliver in every
+bar). Flairs are ordered by volume, largest first, since there are 10+
+categories and an unordered axis would be hard to read.
+
+This is evidence to keep in mind for Step 4 (labeling): any claim like
+"topic X aligns with flair Y" needs to be checked against this actual
+output.
+
+#### Step 3b: Dropping flairs with too few posts before plotting
+
+Flairs with very few posts (a handful of documents) produce
+near-100%-of-one-color bars in the figure below that look like strong
+signal but are actually sampling noise, not real concentration. These
+are filtered out before plotting, not just visually ignored, so the
+figure only shows flairs large enough to say something meaningful.
+
+```{r flair-counts}
+# Count posts per flair and keep flairs with at least 50 posts
+flair_counts <- validacion_flair_final |>
+  filter(!is.na(post_flair)) |>
+  count(post_flair, name = "n_posts", sort = TRUE)
+
+flair_counts
+
+min_posts_flair <- 50
+
+flairs_validos <- flair_counts |>
+  filter(n_posts >= min_posts_flair) |>
+  pull(post_flair)
+
+n_distinct(flair_counts$post_flair)
+length(flairs_validos)
+```
+
+5 flairs fall below the n=50 cutoff (13, 10, 7, 2, and 1 posts,
+33 posts combined out of 57,041), all dropped. `LGBTQIA+` (n=75) stays
+in, just above the line.
+
+```{r fig-flair-stacked}
+# Figure 2: topic composition within each flair
+flair_order <- flair_counts |>
+  filter(post_flair %in% flairs_validos) |>
+  pull(post_flair)
+
+flair_topic_prop <- validacion_flair_final |>
+  filter(!is.na(post_flair), topic != "V1", post_flair %in% flairs_validos) |>
+  mutate(post_flair = factor(post_flair, levels = flair_order))
+
+fig_flair_stacked <- ggplot(flair_topic_prop, aes(x = post_flair, fill = topic)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Topic composition within each flair",
+    subtitle = paste0("V1 (residual) and flairs with n < ", min_posts_flair, " posts excluded from this view"),
+    x = NULL, y = "Proportion of posts", fill = "Topic"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 8))
+
+ggsave("outputs/figures/fig2_flair_topic_composition.png", fig_flair_stacked, width = 9, height = 6, dpi = 300)
+
+fig_flair_stacked
+```
+
+The numbers behind Figure 2 are saved as a table: for each flair, the percentage of its posts in each topic (V1 and the small flairs excluded, as in the figure).
+
+```{r flair-topic-table}
+# Percentage of each flair's posts in each topic (the numbers behind Figure 2)
+flair_topic_table <- flair_topic_prop |>
+  count(post_flair, topic) |>
+  group_by(post_flair) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  ungroup()
+
+write_csv(flair_topic_table, "outputs/tables/fig2_flair_topic_percentages.csv")
+
+flair_topic_table
+```
+
+## Step 4: Topic labeling
+
+Evidence strength is uneven across topics and that unevenness is kept
+visible below rather than smoothed into a uniform narrative: Topics 2
+and 3 are backed by both word content and independent flair
+concentration; Topics 4, 5, and 6 rest on word content alone, with no
+flair that validates them externally.
+
+**Topic 1: residual, not interpreted.** Not a labeling decision but a
+non-decision, documented in the topic modelling document (Step 17): average topic
+probability below chance (1/6), essentially no document giving it
+meaningful secondary weight, and the 5 documents where it does
+dominate share no theme and are spread across different flairs. Treated as noise
+throughout, never named.
+
+Topic 2 (*Relationships & social connection*): words *friend*,
+*talk*, *relationship*, and *social* center on interpersonal
+connection. This is confirmed by flair: the *Relationships* flair
+(n = 2,200) has about 81% of its posts in Topic 2, the
+strongest single piece of flair evidence in the model.
+
+Topic 3 (*Diagnosis journey*): words *diagnose*, *diagnosis*, *adhd*,
+and *experience* center on the diagnostic process and conditions that
+co-occur with autism. The *Diagnosis Journey* flair (n = 1,076) is
+similarly concentrated, about 83% of its posts fall into Topic 3.
+
+Topic 4 (*Emotional struggle*): words *meltdown*, *anxiety*, *cry*,
+and *bad* point to emotional distress, while words *struggle*,
+*issue*, and *hard* frame that distress as an ongoing difficulty. No
+flair in this corpus names this theme directly, so no external
+validation was used.
+
+Topic 5 (*Sensory sensibilities*): words *wear*, *eat*, *sensory*,
+and *noise* read as a catalogue of sensory input across modalities,
+with *sensory* itself among them. Words *hate* and *issue* suggest
+this isn't purely descriptive, some of that input may be experienced
+as difficult or unwanted. No external flair was used for this
+topic's validation.
+
+Topic 6 (*Daily life functionality*): words *job*, *school*, *home*,
+and *week* center on the routine side of daily life. Work and school
+refer to practical responsibilities, rather than the relational or
+emotional side covered in other topics. No flair was used to validate
+this externally either.
+

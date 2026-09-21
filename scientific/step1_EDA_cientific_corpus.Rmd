@@ -1,0 +1,518 @@
+---
+title: "MTh - EDA of the scientific literature corpus"
+subtitle: "Text extraction from PDFs, noise diagnosis and body-text selection"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+## Context
+
+This document is the EDA of the scientific literature corpus (17 papers, PubMed, 2025-May 2026), which is modeled with LDA.
+
+Methodology: evidence before assumption, one step at a time, each decision documented with its justification. This document only keeps the steps that led to the final pipeline.
+
+**Note:** the PDFs are not included in the repository (publisher copyright). To run this document, place them in the folder `official_cientific_corpus`, each file named with its paper number (1-17) first; `data/ids/pubmed_articles.csv` lists the PMID and DOI of each paper. The chunks avoid displaying article text, so the rendered report contains none.
+
+## Libraries
+
+```{r}
+library(tidyverse)  # data manipulation, native pipe |>
+library(pdftools)   # PDF text extraction
+# here() prints the project root when the package is loaded; that root is a
+# machine-specific path, so the startup message is silenced.
+suppressMessages(library(here))  # project-relative paths, so this Rmd runs on any machine
+```
+
+```{r}
+# Folder for the tables saved by this document
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Step 1.1: Raw extraction and document-level inventory
+
+We extract raw text from each of the 17 PDFs and pull basic metadata, to get a first, evidence-based picture of the corpus before deciding anything about cleaning.
+
+```{r}
+pdf_dir <- suppressMessages(here("official_cientific_corpus"))  # adjust the subpath if this folder lives somewhere else in your project
+pdf_files <- list.files(pdf_dir, pattern = "\\.pdf$", full.names = TRUE)
+
+# the leading number in each filename is our own paper numbering (1-17)
+paper_id <- as.integer(str_extract(basename(pdf_files), "^\\d+"))
+pdf_files <- pdf_files[order(paper_id)]
+paper_id  <- sort(paper_id)
+
+stopifnot(length(pdf_files) == 17, all(paper_id == 1:17))
+```
+
+```{r}
+# text per page, for every PDF
+extraction <- map(pdf_files, ~ tryCatch(pdf_text(.x), error = function(e) NA_character_))
+names(extraction) <- paper_id
+
+# PDF metadata (title, page count) via pdf_info(). One file triggers a poppler
+# notice ("Can't revert non decrypt streams"), which usually means that PDF has
+# document-security settings poppler can't fully parse. It turns out to come
+# through as a message rather than a warning, so we catch both to be safe, and
+# print which file it is instead of leaving an unexplained line in the log.
+info <- map(pdf_files, function(f) {
+  withCallingHandlers(
+    tryCatch(pdf_info(f), error = function(e) NULL),
+    warning = function(w) {
+      message("pdf_info() warning on ", basename(f), ": ", conditionMessage(w))
+      invokeRestart("muffleWarning")
+    },
+    message = function(m) {
+      message("pdf_info() notice on ", basename(f), ": ", conditionMessage(m))
+      invokeRestart("muffleMessage")
+    }
+  )
+})
+names(info) <- paper_id
+```
+
+This notice only affects `pdf_info()`, which reads metadata such as title and page count, not the actual page text. The text used for the corpus comes from `pdf_text()` and, later, `pdf_data()`; neither of those returns `NA` or an empty result for any of the 17 files (checked in `doc_summary` below), so it does not affect what gets modeled.
+
+```{r}
+# One row per PDF: title metadata, pages and words
+doc_summary <- tibble(
+  paper_id = paper_id,
+  file     = basename(pdf_files),
+  title    = map_chr(info, ~ ifelse(is.null(.x$keys$Title), NA_character_, .x$keys$Title)),
+  n_pages_text  = map_int(extraction, length),
+  total_words   = map_int(extraction, ~ sum(str_count(.x, "\\S+"), na.rm = TRUE))
+)
+
+doc_summary
+```
+
+```{r}
+# Summary of words per paper
+summary(doc_summary$total_words)
+```
+
+```{r}
+# Summary of pages per paper
+summary(doc_summary$n_pages_text)
+```
+
+Paper 10 stands out as a length outlier (2,289 words, 4 pages, well below the next shortest paper). Likely a short commentary rather than a full research article. **Decision (pending):** whether to model it like the rest or treat it separately.
+
+## Step 1.2: Structural noise diagnosis
+
+Typical academic-PDF noise: repeated headers and footers, loose page numbers, and locating the references block, which we need later since references won't be part of the topic-modeling text.
+
+```{r}
+pages_lines <- map(extraction, ~ map(.x, ~ str_split(.x, "\n")[[1]]))
+
+# candidate headers/footers: short lines repeated >=3 times within the same doc
+detect_repeated_lines <- function(doc_pages_lines) {
+  all_lines <- unlist(doc_pages_lines)
+  all_lines_trim <- str_trim(all_lines)
+  all_lines_trim <- all_lines_trim[nchar(all_lines_trim) > 0 & nchar(all_lines_trim) < 100]
+  tab <- sort(table(all_lines_trim), decreasing = TRUE)
+  tab[tab >= 3]
+}
+repeated_by_doc <- map(pages_lines, detect_repeated_lines)
+
+# standalone page-number lines (a line that is just a number)
+page_number_lines <- map_int(pages_lines, ~ sum(str_detect(str_trim(unlist(.x)), "^\\d{1,4}$")))
+
+# approximate position where "References" starts (% through the document)
+ref_position <- map_dbl(extraction, function(doc_pages) {
+  full_text <- paste(doc_pages, collapse = "\n")
+  lines <- str_split(full_text, "\n")[[1]]
+  idx <- which(str_detect(lines, "^\\s*(REFERENCES|References)\\s*$"))
+  if (length(idx) == 0) return(NA_real_)
+  idx[1] / length(lines) * 100
+})
+
+page_number_lines
+```
+
+```{r}
+# Where "References" starts in each paper (% through the text)
+round(ref_position, 1)
+```
+
+"References" was only detected as a standalone line in 9 of the 17 papers. Checking the other 8 shows the word is there, but glued to unrelated text with no line break, for example `"...vic- References"`. That is the signature of a two-column PDF, where `pdf_text()` reads the page row by row and merges both columns into a single line of text.
+
+```{r}
+# Made-up illustration (not article text) of a two-column page read row by row
+cat(paste0(
+  "The diagnostic criteria were         Participants reported that\n",
+  "revised to include diffi-            they often felt misunderstood\n",
+  "cult social situations.              in social situations.\n"
+))
+```
+
+The illustration is made up, so that no article text is displayed, but it shows the pattern found on the real pages (for example, page 2 of paper 3): the two columns are interleaved word by word, so each "line" is actually `[left column fragment][right column fragment]`. This breaks sentence structure and splits hyphenated words at the wrong point, so `"diffi-"` and `"cult"` end up separated by unrelated text. Before any further cleaning, we need to reconstruct the real reading order.
+
+## Step 1.3: Fixing column order using word-level coordinates
+
+`pdftools::pdf_data()` returns the (x, y) position of every word on the page. We use that to detect where the column boundary sits and reorder the text: left column top to bottom, then right column top to bottom.
+
+Citation superscripts, like `"gender.18"`, sit at a slightly different y than the line they belong to, so they need to be reattached to their word before detecting columns; otherwise they get miscounted as extra lines and can throw off the gap detection.
+
+```{r}
+# Reattach citation superscripts to the word they follow
+fuse_superscripts <- function(page_data, y_window = 8) {
+  page_data <- page_data |> arrange(y, x) |> mutate(row_id = row_number())
+  is_citation <- str_detect(str_trim(page_data$text), "^\\d+(,\\d+)*\\.?$")
+
+  merge_into <- rep(NA_integer_, nrow(page_data))
+  for (i in page_data$row_id[is_citation]) {
+    cit <- page_data[page_data$row_id == i, ]
+    candidates <- page_data |>
+      filter(row_id != i, !is_citation, abs(y - cit$y) <= y_window, x < cit$x) |>
+      mutate(dist = cit$x - (x + width)) |>
+      filter(dist >= -3)
+    if (nrow(candidates) == 0) next
+    best <- candidates |> slice_min(dist, n = 1, with_ties = FALSE)
+    merge_into[page_data$row_id == i] <- best$row_id
+  }
+
+  for (i in page_data$row_id[is_citation]) {
+    target <- merge_into[page_data$row_id == i]
+    if (!is.na(target)) {
+      idx <- which(page_data$row_id == target)
+      cit_text  <- str_trim(page_data$text[page_data$row_id == i])
+      cit_width <- page_data$width[page_data$row_id == i]
+      page_data$text[idx]  <- paste0(page_data$text[idx], cit_text)
+      page_data$width[idx] <- page_data$width[idx] + cit_width
+    }
+  }
+
+  fused_rows <- page_data$row_id[is_citation & !is.na(merge_into[page_data$row_id])]
+  page_data |> filter(!(row_id %in% fused_rows)) |> select(-row_id)
+}
+```
+
+To find the column boundary, we look for the largest gap between consecutive words **within each line**, and only trust it as a real column split if that gap position repeats across most lines on the page (at least 60%). This avoids two false positives we ran into: a wide header line (title plus page number) that looks like a gap but isn't a column, and column gaps that are genuinely narrow, as low as about 8px depending on the journal's layout, which would be missed with a stricter threshold.
+
+```{r}
+# Find the x position where the two columns split (NA if single column)
+detect_column_split <- function(page_data, min_gap = 8, consistency_threshold = 0.6) {
+  line_gaps <- page_data |>
+    arrange(y, x) |>
+    group_by(y) |>
+    mutate(word_end = x + width,
+           gap_before = x - lag(word_end)) |>
+    filter(!is.na(gap_before)) |>
+    slice_max(gap_before, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    filter(gap_before >= min_gap) |>
+    mutate(gap_mid = x - gap_before / 2)
+
+  n_total_lines <- n_distinct(page_data$y)
+  if (n_total_lines == 0 || nrow(line_gaps) / n_total_lines < consistency_threshold) {
+    return(NA_real_)  # no reliable column gap -> treat as single column
+  }
+  median(line_gaps$gap_mid)
+}
+```
+
+```{r}
+# Rebuild the reading order of one page: left column first, then right
+reorder_columns_final <- function(page_data) {
+  if (nrow(page_data) == 0) return("")
+
+  page_data <- fuse_superscripts(page_data)
+  split_x <- detect_column_split(page_data)
+
+  page_data <- page_data |>
+    mutate(column = if (is.na(split_x)) "single" else ifelse(x < split_x, "left", "right"))
+
+  page_data |>
+    arrange(column, y, x) |>
+    group_by(column, y) |>
+    summarise(line = paste(text, collapse = " "), .groups = "drop_last") |>
+    summarise(block = paste(line, collapse = "\n"), .groups = "drop") |>
+    pull(block) |>
+    paste(collapse = "\n")
+}
+```
+
+```{r}
+# Word-level coordinates for every page, then the column-corrected text
+all_page_data <- map(pdf_files, ~ tryCatch(pdf_data(.x), error = function(e) NULL))
+names(all_page_data) <- paper_id
+
+extraction_final <- map(all_page_data, function(doc_pages) {
+  map_chr(doc_pages, reorder_columns_final)
+})
+```
+
+**Sanity check.** Word counts after reordering should only drop by the number of superscripts we fused (two tokens becoming one), nothing more. If they matched exactly, that would confirm the reordering itself isn't losing or duplicating any text.
+
+```{r}
+# Compare word counts before and after reordering
+fusion_counts <- map_int(all_page_data, function(doc_pages) {
+  sum(map_int(doc_pages, function(pd) {
+    if (nrow(pd) == 0) return(0L)
+    nrow(pd) - nrow(fuse_superscripts(pd))
+  }))
+})
+
+tibble(
+  paper_id = paper_id,
+  words_original = map_int(extraction, ~ sum(str_count(.x, "\\S+"), na.rm = TRUE)),
+  words_final    = map_int(extraction_final, ~ sum(str_count(.x, "\\S+"), na.rm = TRUE)),
+  fusions        = fusion_counts
+) |>
+  mutate(diff = words_final - words_original,
+         unexplained = abs(diff) - fusions)
+```
+
+For most papers, `unexplained` sits close to zero, which supports the idea that the drop in word count is explained by the superscript fusions and nothing else. For a handful of papers it is noticeably larger, up to about 170 words in the worst case. We don't have a full account of where that extra gap comes from. `pdf_text()` and `pdf_data()` are known to tokenize the same page slightly differently on their own, which is a separate, harmless quirk unrelated to the reordering logic, and it likely explains part of it, but we can't say it explains all of it. What matters for the pipeline is that the actual corpus text always comes from `extraction_final`, the `pdf_data()`-based, column-corrected version, never from the original `pdf_text()` output, so this gap does not change what gets modeled either way. We're stating it as it is instead of rounding it down to zero.
+
+## Step 1.4: Merging hyphenated line breaks
+
+Now that reading order is correct, words split across a line or column break, like `"diffi-\ncult"`, can be safely rejoined.
+
+```{r}
+# Rejoin words split by a hyphen at a line break
+merge_hyphenated_linebreaks <- function(text) {
+  str_replace_all(text, "([a-z])-\\n\\s*([a-z])", "\\1\\2")
+}
+
+doc_texts_merged <- map(extraction_final, function(pages) {
+  full_text <- paste(pages, collapse = "\n")
+  merge_hyphenated_linebreaks(full_text)
+})
+```
+
+**Known trade-off:** this rule can't tell a genuine line-break split (`"diffi-cult"` becoming `"difficult"`) from a real hyphenated compound that happens to fall at a column edge (`"technically-focused"` becoming `"technicallyfocused"`, losing the hyphen). There's no dictionary-free way to always get this right.
+
+We checked whether this matters in practice. Column detection still misfires on some irregular pages, such as tables, reference lists, and block quotes; regular two-column body text is not affected. This produces a handful of nonsense merges, for example `"fuview"` and `"serals"`. To find out if this is a real problem, we measured how many distinct documents each merged word appears in. Genuine noise from a one-off page glitch should not repeat across papers, while real words naturally do.
+
+```{r}
+# In how many papers does each merged word appear?
+merged_words_by_doc <- map(paper_id, function(id) {
+  original_text <- paste(extraction_final[[as.character(id)]], collapse = "\n")
+  matches <- str_extract_all(original_text, "[a-z]+-\\n\\s*[a-z]+")[[1]]
+  unique(str_replace(matches, "-\\n\\s*", ""))
+})
+names(merged_words_by_doc) <- paper_id
+
+all_merged_words <- unique(unlist(merged_words_by_doc))
+doc_freq <- map_int(all_merged_words, function(w) {
+  sum(map_lgl(paper_id, ~ w %in% merged_words_by_doc[[as.character(.x)]]))
+})
+doc_freq_table <- tibble(word = all_merged_words, doc_frequency = doc_freq)
+
+table(doc_freq_table$doc_frequency)
+```
+
+```{r}
+# Merged words that appear in 5 or more papers
+doc_freq_table |> filter(doc_frequency >= 5) |> arrange(desc(doc_frequency))
+```
+
+87% of merged words (857 of 990) appear in only one document. That is what one-off page glitches look like. The words that appear in 5 or more documents (`doc_frequency >= 5`) are all legitimate, on-topic terms, such as "autistic", "experiences", "participants", and "diagnosis", with no garbage among them.
+
+**Decision:** no further work needed on column-detection edge cases: the residual noise is limited to isolated, one-document terms.
+
+## Step 1.5: Non-ASCII character cleanup
+
+```{r}
+# Distinct non-ASCII characters before cleaning
+all_text_merged <- paste(unlist(doc_texts_merged), collapse = " ")
+non_ascii_before <- unique(str_extract_all(all_text_merged, "[^\\x00-\\x7F]")[[1]])
+length(non_ascii_before)
+```
+
+The 67 distinct non-ASCII characters found fall into clear categories. Invisible formatting artifacts, such as zero-width spaces and soft hyphens, are the most frequent by far. There is also typographic punctuation, like curly quotes and long dashes; symbols with no topical value, like bullets, footnote daggers, copyright marks, and math comparison signs; loose Greek letters used as statistical notation; and legitimate accented letters from author names and non-English terms. We also found a handful of accented letters split into a base letter plus a separate combining accent mark, for example "Happé" stored as "Happe" plus a floating accent. That's a PDF encoding quirk, fixed with Unicode NFC normalization.
+
+```{r}
+# Remove invisible characters and normalize typographic symbols
+clean_noise_characters <- function(text) {
+  text |>
+    stringi::stri_trans_nfc() |>                          # compose decomposed accents
+    str_replace_all("\u200B", "") |>                        # zero-width space
+    str_replace_all("\u00AD", "") |>                        # soft hyphen
+    str_replace_all("[\u202F\u2003\u2002\u00A0]", " ") |>   # narrow/em/en/no-break space -> space
+    str_replace_all("[\u2018\u2019]", "'") |>                # curly single quotes -> straight
+    str_replace_all("[\u201C\u201D]", '"') |>                # curly double quotes -> straight
+    str_replace_all("[\u2013\u2014\u2212\u2010\u2011\u2012]", "-") |>  # dashes/minus -> hyphen
+    str_replace_all("\u2026", "...") |>                      # ellipsis
+    str_replace_all("[\u2022\u2020\u2021\u00A9\u00AE\u2192\u2A7E\u2A7D\u2265\u00B9\u00B2\u00B3\u00AA\u00B4\u00B7\u00A8]", "") |>
+    str_replace_all("[\u03B1\u03B2\u03C7\u03B7]", "") |>     # loose Greek letters (stats notation)
+    str_replace_all("\u0301", "")                            # stray combining marks NFC couldn't fix
+}
+
+doc_texts_clean <- map(doc_texts_merged, clean_noise_characters)
+```
+
+```{r}
+# Non-ASCII characters left after cleaning
+all_text_clean <- paste(unlist(doc_texts_clean), collapse = " ")
+non_ascii_remaining <- str_extract_all(all_text_clean, "[^\\x00-\\x7F]")[[1]]
+tibble(char = non_ascii_remaining) |>
+  count(char, sort = TRUE) |>
+  mutate(codepoint = map_chr(char, ~ sprintf("U+%04X", utf8ToInt(.x))))
+```
+
+67 distinct non-ASCII characters went down to 28, all of them legitimate accented letters. No stray symbols, invisible characters, or broken accents remain.
+
+## Step 1.6: Statistical notation in the running text
+
+Papers 1 and 9 contain results tables embedded in the text flow, for example "M (SD)" and sample sizes. A quick check confirmed that most of that noise, plain numbers and the letter "n", is naturally excluded later by POS-tag filtering, which keeps only NOUN, VERB, ADJ, ADV, and PROPN during lemmatization. A handful of short statistical abbreviations do get mis-tagged as content words and slip through, though: `M` (mean) survives in 13 of the 17 papers, `F` in 9, `SD` in 5 or 6, and `p` in 5. These abbreviations appear in many papers, so unlike the hyphenation edge cases, which are isolated, they are systematic noise that will not disappear on its own.
+
+**Decision (to apply during lemmatization, not here):** add a domain-specific stopword list for statistical notation (`M, SD, F, p, CI, SE, d, t, df, OR, r`).
+
+## Step 1.7: Corpus composition, excluding paper 10
+
+Paper 10 is a length outlier (2,289 words, 4 pages, well below the next shortest paper). Checking its structure confirms it isn't a research article: no Introduction, Methods, Results, or Discussion sections were found, the journal itself labels it "COMMENTARY" in the PDF header, and the author refers to it as an "editorial" in the opening paragraph.
+
+```{r}
+# Look for standard article section headers in paper 10
+lines_p10 <- str_split(doc_texts_clean[["10"]], "\n")[[1]]
+section_headers <- c("introduction", "method", "methods", "results",
+                      "discussion", "conclusion", "abstract", "background")
+found_headers <- lines_p10[str_detect(str_trim(lines_p10),
+  regex(paste0("^(", paste(section_headers, collapse = "|"), ")s?\\.?$"), ignore_case = TRUE))]
+
+found_headers   # character(0) -> no empirical-article sections found
+```
+
+```{r}
+# Look for the journal's "COMMENTARY" label and the word "editorial" (no article text is shown)
+tibble(
+  has_commentary_label = str_detect(doc_texts_clean[["10"]], "COMMENTARY"),
+  n_editorial_mentions = str_count(doc_texts_clean[["10"]], regex("editorial", ignore_case = TRUE))
+)
+```
+
+**Decision:** paper 10 is excluded from the corpus. It's a commentary piece, not an empirical article; a different kind of document from the rest of the sample, and too short to contribute meaningfully to topic modeling either way. Final corpus: **16 papers**.
+
+```{r}
+# Record the excluded paper and the reason
+excluded_papers <- tibble(
+  paper_id = 10,
+  reason   = "Commentary, not an empirical article (2,289 words, 4 pages)"
+)
+
+write_csv(excluded_papers, "outputs/tables/excluded_papers.csv")
+```
+
+```{r}
+# Drop paper 10 and summarize words per paper
+final_paper_id <- setdiff(paper_id, 10)
+
+doc_texts_clean   <- doc_texts_clean[as.character(final_paper_id)]
+doc_summary_final <- doc_summary |> filter(paper_id %in% final_paper_id)
+
+summary(doc_summary_final$total_words)
+```
+
+```{r}
+# Summary of pages per paper (final corpus)
+summary(doc_summary_final$n_pages_text)
+```
+
+## Step 1.8: Excluding references and appendices from the body text
+
+Only the title, abstract, and body count as analysis text for this corpus, per the original search criteria. References and appendices need to be cut out, not just located.
+
+The obvious approach, cutting at the first line matching "References", fails in a subtle way. Paper 9, a systematic review, has the word "References" appearing **three times**: twice as a table label, `"Assessment References"`, part of a GRADE-CERQual methodology table, and only the third time as the real section header.
+
+```{r}
+# Lines matching "References" in paper 9
+lines_p9 <- str_split(doc_texts_clean[["9"]], "\n")[[1]]
+idx_p9 <- which(str_detect(str_trim(lines_p9), regex("(^|\\s)REFERENCES\\.?$", ignore_case = TRUE)))
+tibble(line = idx_p9, text = str_trim(lines_p9[idx_p9]))
+```
+
+So we take the **last** match as the real references header, since the bibliography is always the final section, not the first. For appendices, we take the **first** match, since an appendix marks the end of body text regardless of what follows it.
+
+We also tried extending the cut to other end-of-paper sections, like Informed Consent, Funding, and Acknowledgements, hoping to trim a bit more boilerplate. That kept producing new false positives: a lowercase in-sentence mention of "informed consent" getting mistaken for a section header, and a table column literally labeled "Funding" causing a cut hundreds of lines too early. The rule therefore stays simple: **only References (last match) and Appendix (first match)** mark the cut. Short boilerplate phrases that stay in the body, like a stray "Written informed consent was obtained…", are treated as low-impact noise, the same reasoning as the residual hyphenation edge cases in Step 1.4.
+
+```{r}
+# Cut each paper at its references or appendix; compare words before and after
+split_body_backmatter <- function(full_text) {
+  lines <- str_split(full_text, "\n")[[1]]
+  lines_trim <- str_trim(lines)
+
+  ref_idx <- which(str_detect(lines_trim, regex("(^|\\s)REFERENCES\\.?$", ignore_case = TRUE)))
+  app_idx <- which(str_detect(lines_trim, regex("^APPENDIX(\\s+[A-Z0-9]+)?\\s*[:.]?", ignore_case = TRUE)))
+
+  real_ref <- if (length(ref_idx) > 0) ref_idx[length(ref_idx)] else NA_integer_
+  real_app <- if (length(app_idx) > 0) app_idx[1] else NA_integer_
+
+  cut_candidates <- c(real_ref, real_app)
+  cut_candidates <- cut_candidates[!is.na(cut_candidates)]
+
+  if (length(cut_candidates) == 0) {
+    return(list(body = full_text, backmatter = NA_character_))
+  }
+
+  cut_at <- min(cut_candidates)
+  body_lines <- lines[1:(cut_at - 1)]
+  back_lines  <- lines[cut_at:length(lines)]
+
+  list(body = paste(body_lines, collapse = "\n"),
+       backmatter = paste(back_lines, collapse = "\n"))
+}
+
+split_result <- map(doc_texts_clean, split_body_backmatter)
+doc_texts_body       <- map_chr(split_result, "body")
+doc_texts_backmatter <- map_chr(split_result, "backmatter")
+
+body_summary <- tibble(
+  paper_id = final_paper_id,
+  words_full = map_int(doc_texts_clean, ~ str_count(.x, "\\S+")),
+  words_body = map_int(doc_texts_body, ~ str_count(.x, "\\S+"))
+) |>
+  mutate(pct_removed = round(100 * (words_full - words_body) / words_full, 1)) |>
+  arrange(desc(pct_removed))
+
+# Save the table (also printed below)
+write_csv(body_summary, "outputs/tables/corpus_body_summary.csv")
+
+body_summary
+```
+
+**Systematic verification** (not just eyeballing a few papers): a reference entry usually starts with an author name followed by `"(YYYY)"` close together. If the body's last ~400 characters still show that pattern clustered, the cut happened too early somewhere.
+
+```{r}
+# Check for reference-style years at the end of each body text
+boundary_check <- map_dfr(final_paper_id, function(id) {
+  body_tail <- str_sub(doc_texts_body[[as.character(id)]], -400, -1)
+  tibble(paper_id = id, body_tail_year_matches = str_count(body_tail, "\\([12][0-9]{3}\\)"))
+})
+
+boundary_check |> arrange(desc(body_tail_year_matches))
+```
+
+15 of the 16 papers show 0 matches. Paper 1 shows 1; checked directly, and it's a normal citation at the end of the discussion section, not leftover back matter. The cut boundary is confirmed correct across the whole corpus, not just the papers we happened to look at first.
+
+## Status
+
+`doc_texts_body` (16 papers, references and appendices excluded) is the final output of this document, the input for tokenization, lemmatization with `udpipe`, POS filtering, and the domain-specific stopword list identified in Step 1.6. `doc_texts_backmatter` is kept as well, in case reference or appendix content turns out useful later, for example as metadata.
+
+```{r}
+# Save the cleaned corpus (full text of the papers: kept local, not shared)
+saveRDS(
+  list(
+    paper_id        = final_paper_id,
+    doc_summary     = doc_summary_final,
+    body_text       = doc_texts_body,
+    backmatter_text = doc_texts_backmatter
+  ),
+  file = "literature_corpus_clean.rds"
+)
+
+cat("Saved literature_corpus_clean.rds with", length(final_paper_id), "papers.\n")
+```

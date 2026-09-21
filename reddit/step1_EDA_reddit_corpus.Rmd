@@ -1,0 +1,183 @@
+---
+title: "MTh - EDA of the r/AutismInWomen corpus (prior to filtering)"
+subtitle: "General and textual exploratory analysis, raw unfiltered corpus"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+## Introduction
+
+This document performs the **EDA (general and textual)** on the **raw** corpus of `r/AutismInWomen`, that is, before applying the `has_text == TRUE` filter. The goal is to document, with evidence, why and how the full scraped corpus (~68,788 posts) is reduced to the final corpus used for topic modelling (~57,000 posts).
+
+This EDA is a prior, independent step from the preprocessing/modelling pipeline (covered in a separate `.Rmd`). No lemmatization or DTM construction happens here; the sole purpose is to **understand the corpus** before making filtering decisions.
+
+**Note:** the chunks in this document avoid displaying post content or usernames (for example, `glimpse()` leaves out the text, title, author and link columns, and short texts are grouped by type instead of printed), so the rendered report contains no post text or usernames.
+
+The `tidyverse` meta-package bundles the core libraries needed for this EDA (`dplyr`, `readr`, `stringr`, `tidyr`, `ggplot2`, `lubridate`).
+
+```{r}
+# Load the tidyverse packages
+library(tidyverse)
+```
+
+## Step 1: Loading and basic structure of the raw corpus
+
+The raw scraped corpus is loaded and its row count checked against the documented total (68,788 posts) to confirm a complete, correctly parsed load.
+
+```{r}
+# `distinguished` gets auto-guessed as logical from the first rows (mostly NA),
+# which silently drops real values like "moderator" found further down the file.
+# Read it as character so nothing gets coerced away before we even look at it.
+reddit_raw <- read_csv(
+  "reddit_scrape_raw.csv",
+  col_types = cols(distinguished = col_character())
+)
+
+dim(reddit_raw)
+```
+
+`read_csv()` flags one or more parsing problems on load. Silencing that warning is not the same as confirming it doesn't matter, so we check exactly which rows and columns it affected before trusting anything downstream.
+
+```{r}
+# Show rows the CSV reader could not parse (none expected)
+problems(reddit_raw) |> select(-file)
+```
+
+By default, `read_csv()` would guess `distinguished` as logical from its first values (mostly `NA`), then fail to parse the rows further down that actually contain `"moderator"`, dropping that information as `NA`. Specifying the column as character upfront avoids that: `problems()` above returns 0 rows, and the distinct-value check below confirms `distinguished` has real variation, not just `NA`.
+
+A structural overview of all columns and their data types, used to catch parsing issues early (e.g. a date field read as character instead of datetime).
+
+Columns holding post content or identifying information (`title`, `text`, `author`, `url`, `permalink`) are left out of this printout, so the rendered report does not reproduce any post text or usernames.
+
+```{r}
+# Column names and types (content columns left out)
+reddit_raw |>
+  select(-title, -text, -author, -url, -permalink) |>
+  glimpse()
+```
+
+Distinct-value counts per column are a first anomaly check: an `id` count equal to the total row count rules out duplicate scraping, and a column with a single distinct value (zero variance) signals it carries no usable information.
+
+```{r}
+# Quick check of data types and unique values per column,
+# useful for spotting badly parsed columns (e.g. dates read as text)
+reddit_raw |>
+  summarise(across(everything(), ~ n_distinct(.x))) |>
+  tidyr::pivot_longer(everything(), names_to = "column", values_to = "distinct_values")
+```
+
+## Step 2: Textual EDA, inventory of content in text
+
+`filter()` silently drops rows where the condition evaluates to `NA`, so `is.na(text)` must be added explicitly; otherwise genuinely empty posts would be excluded from this inventory instead of counted. This surfaces every short or missing value of `text`, including non-content markers such as `[removed]` and `[deleted]`.
+
+Non-content markers are shown by name; any other short text is grouped under one label, so no post text is displayed in the rendered report.
+
+```{r}
+# Count missing, [removed], [deleted] and other short texts
+reddit_raw |>
+  filter(is.na(text) | str_length(text) < 20) |>
+  mutate(text_type = case_when(
+    is.na(text) ~ "NA",
+    text %in% c("[removed]", "[deleted]") ~ text,
+    TRUE ~ "other short text (content not shown)"
+  )) |>
+  count(text_type, sort = TRUE)
+```
+
+A manually derived content marker (`NA`, `removed/deleted`, or real text) is cross-tabulated against the pre-existing `has_text` flag, to confirm the two align and to isolate any discrepancy between them.
+
+```{r}
+# Compare my own text label against the has_text flag
+reddit_raw |>
+  mutate(content_marker = case_when(
+    is.na(text) ~ "NA",
+    text %in% c("[removed]", "[deleted]") ~ "removed_deleted",
+    TRUE ~ "real_text"
+  )) |>
+  count(content_marker, has_text)
+```
+
+Four posts have `text == NA` yet `has_text == TRUE`. Inspection confirms their content lives entirely in `title`, which explains the mismatch: `has_text` evidently considers title content, not the `text` field alone.
+
+```{r}
+# `title` and `url` are not displayed (post content); only its length is shown.
+reddit_raw |>
+  filter(is.na(text), has_text == TRUE) |>
+  mutate(n_chars_title = str_length(title)) |>
+  select(id, n_chars_title, has_text, is_self_post, post_flair)
+```
+
+All non-ASCII characters present in real-text posts are inventoried by frequency. This anticipates every symbol category (emoji, typographic punctuation, accented letters) that the cleaning step of the preprocessing pipeline will need to handle.
+
+```{r}
+# Count non-ASCII characters, most frequent first
+rare_characters <- reddit_raw |>
+  filter(!is.na(text)) |>
+  pull(text) |>
+  str_extract_all("[^[:ascii:]]") |>
+  unlist() |>
+  table() |>
+  sort(decreasing = TRUE)
+
+head(rare_characters, 40)
+```
+
+The curly apostrophe (`’`) is by far the most frequent non-ASCII character (217,972 occurrences), consistent with mobile keyboards auto-correcting straight apostrophes in contractions. This gives a lower-bound estimate of posts affected.
+
+```{r}
+# Count posts with a curly-apostrophe contraction
+reddit_raw |>
+  filter(str_detect(text, "don’t|isn’t|wasn’t|didn’t|couldn’t|wouldn’t")) |>
+  nrow()
+```
+
+A synthetic example (not a real post) containing curly-apostrophe contractions is used for a manual before/after check of the cleaning rule.
+
+```{r}
+# Example sentence to test the cleaning rule
+test_example <- "I don’t know why it isn’t working"
+
+test_example
+```
+
+Removing both the straight (`'`) and curly (`’`) apostrophe before the general non-ASCII/punctuation replacement fuses the contraction correctly (`dont`) instead of splitting it (`don t`). This confirms the rule to be carried into the preprocessing pipeline.
+
+```{r}
+# Apply the cleaning rule: lowercase, drop apostrophes, punctuation and non-ASCII
+test_example |>
+  str_to_lower() |>
+  str_remove_all("['’]") |>
+  str_replace_all("[^[:ascii:]]", " ") |>
+  str_replace_all("[[:punct:]]", " ") |>
+  str_squish()
+```
+
+## Step 3: Final filtering and export
+
+Based on the evidence gathered above, the corpus is filtered to `has_text == TRUE` (57,070 posts). This excludes moderator-removed, user-deleted, and genuinely empty posts, while correctly retaining the four title-only cases identified earlier. The filtered corpus is exported as a single CSV, which becomes the input for the preprocessing pipeline (lemmatization, DTM/biterms construction, LDA/BTM).
+
+The output filename matches the path already referenced in the preprocessing `.Rmd`, so it can be picked up there without further changes.
+
+```{r}
+# Keep only posts with text
+reddit_filtered <- reddit_raw |>
+  filter(has_text == TRUE)
+
+nrow(reddit_filtered)
+```
+
+```{r}
+# Save the filtered corpus (input for step 2)
+write_csv(reddit_filtered, "reddit_filtered.csv")
+```

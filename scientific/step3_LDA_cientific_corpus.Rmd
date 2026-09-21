@@ -1,0 +1,321 @@
+---
+title: "MTh - LDA topic modelling on the scientific literature corpus"
+subtitle: "k selection, model fitting, and topic extraction"
+author: "J. E."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+## Introduction
+
+This document builds the LDA topic model for the scientific literature corpus, starting from `tokens_clean_lemmatized_literature.csv` (16 papers, 58,060 tokens, 6,896 lemmas, unpruned).
+
+k is selected by a qualitative comparison of the resulting topics.
+
+**Note:** the table that summarises k selection (top terms and dominant papers for k = 4 to 8) is saved in `outputs/tables/`, together with the topic-term and paper-topic tables of the final model (Step 2.4). The seed is passed to `LDA()` through `control = list(seed = 123)`, so repeated runs give the same models.
+
+```{r}
+# Load packages
+library(tidyverse)
+library(tidytext)
+library(topicmodels)
+```
+
+```{r}
+# Folder for the tables saved by this document
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Step 1: Building the document-term matrix
+
+The tokens are not pruned by document frequency, so any noise still hiding in them survives straight into the DTM. Building the DTM is what surfaced it.
+
+```{r}
+# Read the token table and the full udpipe annotation from the preprocessing
+tokens_clean <- read_csv("tokens_clean_lemmatized_literature.csv")
+annotation   <- readRDS("annotation_literatura.rds")  # full udpipe annotation, used in 1.3
+
+nrow(tokens_clean)
+```
+
+```{r}
+# Number of papers
+n_distinct(tokens_clean$paper_id)
+```
+
+```{r}
+# Build a document-term matrix (papers x lemmas)
+dtm <- tokens_clean |>
+  count(paper_id, lemma) |>
+  cast_dtm(document = paper_id, term = lemma, value = n)
+
+dtm
+```
+
+`Maximal term length: 72` is the first red flag; no real English lemma is that long.
+
+### 1.1: URL, email, and DOI fragments
+
+```{r}
+# The 5 longest lemmas, to spot noise
+tokens_clean |>
+  mutate(lemma_length = str_length(lemma)) |>
+  arrange(desc(lemma_length)) |>
+  distinct(lemma, lemma_length) |>
+  head(5)
+```
+
+`udpipe` failed to split these into separate tokens, so they survived as one giant "word" each. A pattern-based filter removes them: URLs (`http`, `www.`), common domains (`.com`, `.org`, `.edu`, `.net`, `.gov`), email addresses (`@`), DOI prefixes, and any term containing `/` (which also catches article codes like `aut0010.1177/...`). This same pattern also catches ORCID identifiers, since they always appear as full `https://orcid.org/...` URLs in this corpus rather than as bare digit strings.
+
+```{r}
+# Remove URLs, email addresses and DOI fragments
+tokens_clean_v2 <- tokens_clean |>
+  filter(!str_detect(lemma, "http|www\\.|\\.(com|org|edu|net|gov)|@|^doi|/"))
+
+nrow(tokens_clean)
+```
+
+```{r}
+# Tokens after removing URL, email and DOI fragments
+nrow(tokens_clean_v2)
+```
+
+### 1.2: Digits glued to words
+
+```{r}
+# Number of distinct lemmas that contain digits
+tokens_clean_v2 |>
+  filter(str_detect(lemma, "\\d")) |>
+  distinct(lemma) |>
+  nrow()
+```
+
+```{r}
+# The 10 most frequent lemmas that contain digits
+tokens_clean_v2 |>
+  filter(str_detect(lemma, "\\d")) |>
+  count(lemma, sort = TRUE) |>
+  head(10)
+```
+
+314 terms: article codes, table labels, dates, citation numbers stuck to the preceding word (`pmc2025`, `table3`, `april2025`…). Before removing them blanket-style, worth checking that legitimate diagnostic-instrument names with numbers in them (DSM-5, AQ-10, RAADS-14…) aren't caught in the same net.
+
+```{r}
+# Check that instrument names such as DSM, ICD or SRS survive as separate tokens
+tokens_clean_v2 |>
+  filter(str_detect(lemma, regex("^(dsm|icd|aq|raads|srs|ados|adi)$", ignore_case = TRUE))) |>
+  count(lemma, sort = TRUE)
+```
+
+They survive as separate tokens (`udpipe` split "DSM-5" into "dsm" and "5"), so it's safe to drop every remaining term with an embedded digit.
+
+```{r}
+# Remove lemmas with embedded digits
+tokens_clean_v3 <- tokens_clean_v2 |>
+  filter(!str_detect(lemma, "\\d"))
+
+nrow(tokens_clean_v2)
+```
+
+```{r}
+# Tokens after removing lemmas with digits
+nrow(tokens_clean_v3)
+```
+
+### 1.3: Citation surnames tagged as proper nouns
+
+The trickiest case. Author surnames cited in the running text (not just in the references block, which was already excluded in the EDA) get tagged `PROPN` and kept by the `upos` filter, for example "Chapman", "Sasson", "Guba".
+
+```{r}
+# Find lemmas tagged as proper nouns every time they appear
+lemma_upos_summary <- annotation |>
+  mutate(lemma_lower = str_to_lower(lemma)) |>
+  filter(lemma_lower %in% tokens_clean_v3$lemma) |>
+  distinct(lemma_lower, upos) |>
+  group_by(lemma_lower) |>
+  summarise(tagged_propn_only = all(upos == "PROPN"), .groups = "drop")
+
+propn_only_terms <- lemma_upos_summary |> filter(tagged_propn_only)
+nrow(propn_only_terms)
+```
+
+```{r}
+# Share of tokens (%) in those lemmas
+total_tokens_affected <- tokens_clean_v3 |> filter(lemma %in% propn_only_terms$lemma_lower) |> nrow()
+round(100 * total_tokens_affected / nrow(tokens_clean_v3), 2)
+```
+
+904 terms flagged this way (words tagged `PROPN` every single time they appear, never as a common word elsewhere), 3.77% of the corpus by volume. Two automated rules were tried to separate real surnames from topically-relevant words that happened to get mistagged:
+
+- **Surname + nearby year** (e.g. "Chapman… 2022"): worked for some citation styles but missed others, since numbered-citation papers never put the surname next to a year in the body text.
+- **Always-PROPN + low document-frequency**: didn't hold up. Important terms like `symptoms` and `neuropsychiatric` turned out to have `doc_frequency == 1`, identical to genuine surnames like `sasson` or `heidegger`. There's no clean signal separating them.
+
+```{r}
+# In how many papers does each of those lemmas appear?
+propn_doc_freq <- tokens_clean_v3 |>
+  filter(lemma %in% propn_only_terms$lemma_lower) |>
+  distinct(paper_id, lemma) |>
+  count(lemma, name = "doc_frequency")
+
+table(propn_doc_freq$doc_frequency)
+```
+
+797 of the 904 terms (88%) appear in only one document. For those, there's no reliable way to tell noise from rare-but-real content, so they're left untouched. The remaining 107 (`doc_frequency >= 2`) are a small enough list to review by hand instead.
+
+```{r}
+# Lemmas that appear in 2 or more papers (reviewed by hand)
+propn_review_list <- propn_doc_freq |> filter(doc_frequency >= 2) |> arrange(desc(doc_frequency))
+nrow(propn_review_list)
+```
+
+Manual review of those 107 confirmed 96 as real noise (surnames, first names, institutions, journals/publishers, countries, cities, months) and kept the rest as legitimate vocabulary (`traits`, `skills`, `faculty`, `lab`, `nursing`, `revised`, `spss`, `stata`, and `adi`, the ADI-R diagnostic instrument, same category as `dsm`/`srs`/`icd` confirmed safe earlier).
+
+```{r}
+propn_remove_list <- c(
+  # surnames / first names
+  "baron", "jones", "nicolaidis", "ritvo", "wilson", "allison", "begeer",
+  "hayward", "kentrou", "mcdonnell", "milton", "napolitano", "pellicano",
+  "wood", "ahmed", "baldwin", "belcher", "bertilsdotter", "brede", "costley",
+  "delucia", "downie", "dubreucq", "fletcher", "fortuna", "garcía",
+  "gillberg", "gray", "gruber", "hedlund", "howard", "hus", "jackson",
+  "kanfiszer", "khudiakova", "kim", "kopp", "mclean", "mello", "miller",
+  "milner", "moseley", "perry", "pisula", "raz", "rosqvist", "schneid",
+  "strang", "szatmari", "taylor", "trundle", "vries", "williams", "sarah",
+  "alexandra", "gemma", "hannah", "mary", "miranda", "danielle", "george",
+  # institutions / journals / publishers / countries / cities / dates
+  "commons", "united", "institute", "international", "australia", "england",
+  "ireland", "london", "usa", "canada", "city", "birmingham", "basel",
+  "italy", "netherlands", "north", "northern", "poland", "sweden",
+  "switzerland", "los", "francis", "autistica", "pubmed", "scopus", "mdpi",
+  "licensee", "inc.", "microsoft", "u.s.", "january", "february",
+  "november", "december", "excellence"
+)
+
+tokens_clean_v4 <- tokens_clean_v3 |>
+  filter(!lemma %in% propn_remove_list)
+
+nrow(tokens_clean_v3)
+```
+
+```{r}
+# Tokens after removing the reviewed proper nouns
+nrow(tokens_clean_v4)
+```
+
+### 1.4: Final DTM
+
+```{r}
+# Final document-term matrix
+dtm <- tokens_clean_v4 |>
+  count(paper_id, lemma) |>
+  cast_dtm(document = paper_id, term = lemma, value = n)
+
+dtm
+```
+
+```{r}
+# Save the document-term matrix (word counts per paper: kept local)
+saveRDS(dtm, "dtm_literatura_final.rds")
+```
+
+16 documents by 6,438 terms, 84% sparsity. This is the input for k selection.
+
+## Step 2: Selecting k
+
+### 2.1: Log-likelihood doesn't help
+
+```{r}
+# Fit LDA for k = 2 to 10 and compare log-likelihood
+set.seed(123)
+k_candidates <- 2:10
+
+lda_models <- map(k_candidates, ~ LDA(dtm, k = .x, control = list(seed = 123)))
+names(lda_models) <- k_candidates
+
+map_dbl(lda_models, logLik)
+```
+
+Log-likelihood keeps improving as k grows; it always will, since more topics can always fit the training data a bit better. It cannot pick k, so k is chosen by reading the topics.
+
+### 2.2: Why k=2 is ruled out
+
+k=2 is the smallest value in the range, so it is checked first: its top terms show whether two distinct themes emerge.
+
+```{r}
+# Function that lists the top 10 terms of each topic; top terms for k = 2
+print_top_terms <- function(lda_model, n_terms = 10) {
+  tidy(lda_model, matrix = "beta") |>
+    group_by(topic) |>
+    slice_max(beta, n = n_terms) |>
+    arrange(topic, desc(beta)) |>
+    summarise(top_terms = paste(term, collapse = ", "), .groups = "drop")
+}
+
+print_top_terms(lda_models[["2"]])
+```
+
+The two topics share 7 of their top 10 words ("autistic", "woman", "experience", "autism", "study", "social", "participant"). k=2 isn't finding two themes, it's splitting the corpus's shared vocabulary roughly in half. Ruled out.
+
+### 2.3: Comparing k=4 through k=8
+
+Two things checked for each candidate: whether the topics read as genuinely distinct (not two versions of the same theme), and whether they're reasonably spread across documents rather than dominated by one or two papers. That's a real risk with only 16 documents, where a model with, say, 8 topics is averaging just 2 papers per topic.
+
+```{r}
+# For k = 4 to 8: top terms and number of dominant papers per topic
+for (k in 4:8) {
+  cat("\n==================== k =", k, "====================\n")
+
+  topics_k <- print_top_terms(lda_models[[as.character(k)]])
+  for (i in 1:nrow(topics_k)) cat("Topic", topics_k$topic[i], ":", topics_k$top_terms[i], "\n")
+
+  gamma_k <- tidy(lda_models[[as.character(k)]], matrix = "gamma")
+  doc_spread <- gamma_k |> group_by(topic) |> summarise(n_docs_dominant = sum(gamma > 0.5), .groups = "drop")
+  cat("\nDocuments per topic (gamma > 0.5):", paste(doc_spread$n_docs_dominant, collapse = ", "), "\n")
+}
+```
+
+```{r}
+# Top terms and number of dominant papers per topic for k = 4 to 8, saved as a table
+k_comparison <- map_dfr(4:8, function(k) {
+  model_k <- lda_models[[as.character(k)]]
+  spread <- tidy(model_k, matrix = "gamma") |>
+    group_by(topic) |>
+    summarise(n_docs_dominant = sum(gamma > 0.5), .groups = "drop")
+  print_top_terms(model_k) |>
+    left_join(spread, by = "topic") |>
+    mutate(k = k, .before = topic)
+})
+
+write_csv(k_comparison, "outputs/tables/lda_k4_k8_topics.csv")
+```
+
+Reading through the range:
+
+- **k=4 and k=5** both keep suicidal ideation and flourishing/wellbeing mixed into a single topic, two fairly opposite themes stuck together.
+- **k=6** is the first point where those two separate into their own topics, and every topic is still shared by at least 2 documents.
+- **k=7 and k=8** separate things a bit further, but a cited author's surname ("hampton") shows up among one topic's top words, and some topics become dominated by a single document. Those are signs the model is starting to fit individual papers rather than themes shared across the corpus.
+
+### 2.4: Decision
+
+k=6 is the only point in the range compared (k = 4 to 8) where topics read as genuinely distinct *and* no topic is dominated by a single paper. k is chosen by this qualitative read, plus one extra check, document spread, that matters especially with a corpus this small.
+
+The fitted model is saved locally. Its two probability tables, topic-term (`beta`) and paper-topic (`gamma`), are saved as CSV; they are what the interpretation of the topics needs.
+
+```{r}
+# Final model (k = 6): save the model object locally, and its two tables as CSV
+lda_final <- lda_models[["6"]]
+saveRDS(lda_final, "lda_final_k6.rds")
+
+tidy(lda_final, matrix = "beta")  |> write_csv("outputs/tables/lda_final_beta.csv")
+tidy(lda_final, matrix = "gamma") |> write_csv("outputs/tables/lda_final_gamma.csv")
+```

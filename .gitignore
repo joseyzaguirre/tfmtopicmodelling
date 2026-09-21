@@ -8,27 +8,33 @@
 rsconnect/
 
 # renv (renv.lock SÍ se sube)
-renv/library/
-renv/local/
-renv/staging/
+**/renv/library/
+**/renv/local/
+**/renv/staging/
 
 # Sistema
 .DS_Store
 Thumbs.db
 
 # ---- Datos y archivos intermedios: se ignoran por defecto ----
-# (contienen texto de posts o de artículos, o se pueden regenerar)
 *.csv
 *.rds
 *.pdf
 *.html
 *.udpipe
-data/raw/
+**/data/raw/
 official_cientific_corpus/
 checkpoint_v1_sin_stopwords_custom/
 
-# ---- Excepciones: esto SÍ se sube (no contiene texto) ----
-!data/ids/*.csv
-!outputs/tables/*.csv
-!modelo_final_btm.rds
-!topic_dominante_final.rds
+# Las figuras las genera quien ejecuta el código
+**/outputs/figures/
+
+# ---- Excepciones: esto SÍ se sube (sin texto de posts ni de artículos) ----
+!**/data/ids/*.csv
+!**/outputs/tables/*.csv
+!**/tokens_clean_lemmatized.csv
+!**/tokens_clean_lemmatized_literature.csv
+!**/btm_data_v2.rds
+!**/dtm_literatura_final.rds
+!**/modelo_final_btm.rds
+!**/topic_dominante_final.rds
